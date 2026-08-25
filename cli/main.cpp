@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 
+#include "memory_observatory/compare.h"
 #include "memory_observatory/observatory.h"
 #include "memory_observatory/provider.h"
 #include "memory_observatory/report.h"
@@ -257,8 +258,47 @@ int main(int argc, char** argv) {
   }
 
   if (cmd == "compare") {
-    std::fprintf(stderr, "compare is implemented via the library API in examples; CLI compare requires two trace files.\n");
-    return 2;
+    if (argc < 4) {
+      std::fprintf(stderr, "usage: compare <left-trace> <right-trace> [--json|--csv]\n");
+      return 2;
+    }
+    bool json = false, csv = false;
+    for (int i = 4; i < argc; ++i) {
+      if (std::strcmp(argv[i], "--json") == 0) json = true;
+      if (std::strcmp(argv[i], "--csv") == 0) csv = true;
+    }
+    auto load_trace = [](const char* path, Trace& out) -> bool {
+      std::ifstream f(path, std::ios::binary);
+      if (!f) { std::fprintf(stderr, "cannot open %s\n", path); return false; }
+      std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(f)), {});
+      const bool jsonish = std::strlen(path) > 5 &&
+                           std::strcmp(path + std::strlen(path) - 5, ".json") == 0;
+      Result<Trace> tr;
+      if (jsonish) {
+        std::string text(bytes.begin(), bytes.end());
+        tr = deserialize_trace_json(text);
+      } else {
+        tr = deserialize_trace_binary(bytes.data(), bytes.size());
+        if (!tr.ok()) {
+          std::string text(bytes.begin(), bytes.end());
+          tr = deserialize_trace_json(text);
+        }
+      }
+      if (!tr.ok()) {
+        std::fprintf(stderr, "cannot parse trace %s: %s\n", path, tr.error().message().c_str());
+        return false;
+      }
+      out = std::move(tr.value());
+      return true;
+    };
+    Trace left, right;
+    if (!load_trace(argv[2], left) || !load_trace(argv[3], right)) return 1;
+    auto cmp = compare_traces(left, right);
+    if (!cmp.ok()) { std::fprintf(stderr, "compare failed: %s\n", cmp.error().message().c_str()); return 1; }
+    if (json) std::printf("%s\n", render_compare_json(cmp.value()).c_str());
+    else if (csv) std::printf("%s", render_compare_csv(cmp.value()).c_str());
+    else std::printf("%s", render_compare_text(cmp.value()).c_str());
+    return 0;
   }
 
   if (cmd == "report") {

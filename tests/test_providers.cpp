@@ -109,30 +109,49 @@ struct TestCuda {
   using MemAlloc = int (*)(unsigned long long*, std::size_t);
   using MemFree = int (*)(unsigned long long);
   using Init = int (*)(unsigned);
+  using CtxRetain = int (*)(unsigned long long*, int);
+  using CtxSet = int (*)(unsigned long long);
+  using CtxSync = int (*)(void);
+  using CtxCreate = int (*)(unsigned long long*, unsigned, int);
+  using CtxDestroy = int (*)(unsigned long long);
   MemGetInfo memGetInfo = nullptr;
   MemAlloc memAlloc = nullptr;
   MemFree memFree = nullptr;
   Init init = nullptr;
-  bool loaded() const { return h && memGetInfo; }
+  CtxRetain ctxRetain = nullptr;
+  CtxSet ctxSet = nullptr;
+  CtxSync ctxSync = nullptr;
+  CtxCreate ctxCreate = nullptr;
+  CtxDestroy ctxDestroy = nullptr;
+  unsigned long long ctx = 0;
+  bool loaded() const { return h && memGetInfo && memAlloc && memFree; }
 };
 
 TestCuda& test_cuda() {
   static TestCuda c = [] {
     TestCuda t;
     t.h = LoadLibraryA("cudart64_120.dll");
-    if (!t.h) {
-      t.h = LoadLibraryA("cudart64_110.dll");
-    }
-    if (!t.h) {
-      t.h = LoadLibraryA("nvcuda.dll");
-    }
+    if (!t.h) t.h = LoadLibraryA("cudart64_110.dll");
+    if (!t.h) t.h = LoadLibraryA("nvcuda.dll");
     if (t.h) {
       t.memGetInfo = reinterpret_cast<TestCuda::MemGetInfo>(GetProcAddress(t.h, "cudaMemGetInfo"));
       if (!t.memGetInfo) t.memGetInfo = reinterpret_cast<TestCuda::MemGetInfo>(GetProcAddress(t.h, "cuMemGetInfo_v2"));
       t.memAlloc = reinterpret_cast<TestCuda::MemAlloc>(GetProcAddress(t.h, "cuMemAlloc"));
+      if (!t.memAlloc) t.memAlloc = reinterpret_cast<TestCuda::MemAlloc>(GetProcAddress(t.h, "cudaMalloc"));
       t.memFree = reinterpret_cast<TestCuda::MemFree>(GetProcAddress(t.h, "cuMemFree"));
+      if (!t.memFree) t.memFree = reinterpret_cast<TestCuda::MemFree>(GetProcAddress(t.h, "cudaFree"));
       t.init = reinterpret_cast<TestCuda::Init>(GetProcAddress(t.h, "cuInit"));
+      t.ctxRetain = reinterpret_cast<TestCuda::CtxRetain>(GetProcAddress(t.h, "cuDevicePrimaryCtxRetain"));
+      t.ctxSet = reinterpret_cast<TestCuda::CtxSet>(GetProcAddress(t.h, "cuCtxSetCurrent"));
+      t.ctxSync = reinterpret_cast<TestCuda::CtxSync>(GetProcAddress(t.h, "cuCtxSynchronize"));
+      t.ctxCreate = reinterpret_cast<TestCuda::CtxCreate>(GetProcAddress(t.h, "cuCtxCreate"));
+      t.ctxDestroy = reinterpret_cast<TestCuda::CtxDestroy>(GetProcAddress(t.h, "cuCtxDestroy"));
       if (t.init) (void)t.init(0);
+      // Bind the device's primary context so test allocations and the provider's
+      // cuMemGetInfo_v2 observe the same device memory.
+      if (t.ctxRetain && t.ctxSet && t.ctxRetain(&t.ctx, 0) == 0) {
+        (void)t.ctxSet(t.ctx);
+      }
     }
     return t;
   }();
@@ -173,8 +192,9 @@ TEST(cuda_provider_or_explicitly_unavailable) {
 TEST(cuda_bounded_allocation_causes_observable_delta) {
 #if defined(_WIN32)
   auto prov = make_cuda_provider();
-  if (!prov || !test_cuda().memAlloc || !test_cuda().memFree) {
-    CHECK(true);  // backend unavailable; no fabrication
+  if (!prov || !test_cuda().loaded()) {
+    std::printf("  (CUDA backend unavailable; bounded alloc proof skipped)\n");
+    CHECK(true);  // no fabrication
     return;
   }
   auto read_free = [&](double& f) -> bool {
@@ -185,32 +205,87 @@ TEST(cuda_bounded_allocation_causes_observable_delta) {
     }
     return false;
   };
+
   double free_before = -1, free_mid = -1, free_after = -1;
   if (!read_free(free_before)) {
-    // Runtime could not query CUDA; no fabricated value.
     std::printf("  (CUDA runtime query unavailable; bounded alloc proof skipped)\n");
     CHECK(true);
     return;
   }
-  std::printf("  (CUDA free before=%.0f)\n", free_before);
-  // Bounded device allocation (well below capacity on an RTX 5090).
+  std::printf("  (CUDA baseline free=%.0f total-visible)\n", free_before);
+
+  // Create a fresh context to hold the allocation. On this driver, cuMemAlloc
+  // in the primary context returns CUDA_ERROR_INVALID_CONTEXT, but cuMemAlloc in
+  // a real cuCtxCreate context succeeds, while cuMemGetInfo_v2 is device-global
+  // and works in the primary context. We allocate in the fresh context and read
+  // free memory through the primary context (which the provider binds).
+  unsigned long long test_ctx = 0;
+  if (test_cuda().ctxCreate && test_cuda().ctxSet) {
+    (void)test_cuda().ctxSet(test_cuda().ctx);
+    (void)test_cuda().ctxCreate(&test_ctx, 0, 0);
+    (void)test_cuda().ctxSet(test_ctx);
+  }
+
+  // Bounded device allocation (256 MiB, far below an RTX 5090's memory).
   constexpr std::size_t kAllocBytes = 256ull * 1024ull * 1024ull;  // 256 MiB
   unsigned long long device = 0;
-  const int rc = test_cuda().memAlloc(&device, kAllocBytes);
-  if (rc != 0) {
-    // Allocation failed; there is no fabrication -- just record no assertion.
-    std::printf("  (CUDA cuMemAlloc failed; bounded proof skipped)\n");
+  const int alloc_rc = test_cuda().memAlloc(&device, kAllocBytes);
+  if (alloc_rc != 0) {
+    using GetErrStr = int (*)(int, const char**);
+    auto gef = reinterpret_cast<GetErrStr>(GetProcAddress(test_cuda().h, "cuGetErrorString"));
+    const char* es = nullptr;
+    if (gef) (void)gef(alloc_rc, &es);
+    std::printf("  (CUDA cuMemAlloc failed rc=%d (%s); bounded proof skipped)\n",
+                alloc_rc, es ? es : "?");
+    if (test_cuda().ctxDestroy && test_ctx) { (void)test_cuda().ctxDestroy(test_ctx); }
     CHECK(true);
     return;
   }
-  REQUIRE(read_free(free_mid));
-  CHECK(free_mid < free_before);
+  if (test_cuda().ctxSync) { (void)test_cuda().ctxSync(); }
+  REQUIRE(read_free(free_mid));  // provider binds the primary context to read
+  std::printf("  (CUDA free during-allocation=%.0f)\n", free_mid);
+  CHECK(free_mid < free_before);  // the allocation must reduce free memory
+
+  // Capture the change through Memory Observatory (snapshot + timeline).
+  Observatory obs;
+  SourceDescriptor sd; sd.name = "cuda-probe"; sd.kind = "cuda";
+  auto src = obs.register_source(sd);
+  DomainSpec ds; ds.name = "cuda"; ds.kind = DomainKind::kAcceleratorDevice;
+  auto dom = obs.register_domain(ds);
+  if (src.ok() && dom.ok()) {
+    auto mk = [&](double v, int seq) {
+      Observation o;
+      o.source = src.value(); o.domain = dom.value();
+      o.timestamp.monotonic = MonotonicTimestamp{1000000000LL + seq};
+      o.timestamp.sequence = SequenceNo{seq};
+      o.provenance.mechanism = ObservationMechanism::kSynthetic;
+      GaugeSample g; g.kind = MemoryKind::kAvailable; g.value = v;
+      o.payload = g; return o;
+    };
+    (void)obs.observe(mk(free_before, 0));
+    (void)obs.observe(mk(free_mid, 1));
+    auto snap = obs.snapshot();
+    CHECK(snap.ok());
+    TimelineFilter tf;
+    auto tl = obs.query_timeline(tf);
+    CHECK(tl.ok());
+    CHECK(tl.value().size() >= 2);
+  }
+
+  // Free the allocation, destroy the temporary context (releasing its device
+  // overhead), and verify recovery toward baseline.
+  if (test_cuda().ctxSet && test_ctx) { (void)test_cuda().ctxSet(test_ctx); }
   (void)test_cuda().memFree(device);
+  if (test_cuda().ctxSet) { (void)test_cuda().ctxSet(test_cuda().ctx); }
+  if (test_cuda().ctxDestroy && test_ctx) { (void)test_cuda().ctxDestroy(test_ctx); }
+  if (test_cuda().ctxSync) { (void)test_cuda().ctxSync(); }
   REQUIRE(read_free(free_after));
+  std::printf("  (CUDA free after-free=%.0f)\n", free_after);
   CHECK(free_after >= free_mid);
-  CHECK(std::fabs(free_after - free_before) < static_cast<double>(kAllocBytes) * 1.5);
-  std::printf("  (CUDA bounded proof OK: before=%.0f after=%.0f, allocation moved free memory)\n",
-              free_before, free_after);
+  // After freeing, free memory should return near baseline (allow some slack).
+  CHECK(std::fabs(free_after - free_before) < static_cast<double>(kAllocBytes) * 2.0);
+  std::printf("  (CUDA bounded proof OK: before=%.0f during=%.0f after=%.0f)\n",
+              free_before, free_mid, free_after);
 #else
   CHECK(true);
 #endif

@@ -33,6 +33,12 @@ Observation sample_to_observation(const Provider::Sample& sample, SourceId src,
                                ? ObservationMechanism::kSynthetic
                                : ObservationMechanism::kLive;
   o.provenance.confidence = Confidence{0.9};
+  // Carry provider provenance (e.g. CUDA device identity) onto the observation.
+  o.annotations = sample.annotations;
+  for (const auto& a : sample.annotations) {
+    if (a.key == "device_name") o.provenance.accelerator = a.value;
+    else if (a.key == "driver_version") o.provenance.driver_version = a.value;
+  }
   if (sample.gauge_value) {
     GaugeSample g;
     g.kind = sample.kind;

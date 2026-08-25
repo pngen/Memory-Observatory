@@ -4,11 +4,12 @@
 #include "memory_observatory/provider.h"
 
 #include <algorithm>
-#include <cstring>
 #include <cmath>
+#include <cstring>
 #include <cstdint>
 #include <random>
-#include <sstream>
+#include <string>
+#include <vector>
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -25,7 +26,9 @@ namespace {
 class SyntheticProvider final : public Provider {
  public:
   SyntheticProvider(std::string name, std::uint64_t seed, DomainKind kind)
-      : name_(std::move(name)), seed_(seed), kind_(kind) {}
+      : name_(std::move(name)), kind_(kind) {
+    (void)seed;
+  }
   std::string name() const override { return name_; }
   std::string kind() const override { return "synthetic"; }
   std::string provider_version() const override { return "1.0.0"; }
@@ -34,7 +37,6 @@ class SyntheticProvider final : public Provider {
   CollectResult collect() override {
     ++tick_;
     const double base = 16.0 * 1024.0 * 1024.0 * 1024.0;  // 16 GiB physical
-    // A deterministic, gently rising allocation series so diagnostics can fire.
     const double alloc = base * (0.40 + 0.10 * std::sin(static_cast<double>(tick_) * 0.1) +
                                  0.03 * static_cast<double>(tick_ % 20) / 20.0);
     const double avail = base - alloc;
@@ -62,7 +64,6 @@ class SyntheticProvider final : public Provider {
   }
  private:
   std::string name_;
-  std::uint64_t seed_;
   DomainKind kind_;
   std::uint64_t tick_ = 0;
 };
@@ -118,7 +119,6 @@ class SystemCommitProvider final : public Provider {
       return r;
     }
     r.ok = true;
-    // Commit charge = page file committed.
     Sample committed;
     committed.domain_kind = DomainKind::kSystemCommit;
     committed.kind = MemoryKind::kCommitted;
@@ -184,7 +184,6 @@ class PushProvider final : public Provider {
   DomainKind primary_domain() const override { return DomainKind::kUserDefined; }
   bool available() const override { return true; }
   CollectResult collect() override {
-    // A push provider does not collect; it receives observations externally.
     CollectResult r;
     r.ok = true;
     return r;
@@ -201,6 +200,7 @@ class PushProvider final : public Provider {
 std::unique_ptr<Provider> make_synthetic_provider(const std::string& name,
                                                   std::uint64_t seed,
                                                   DomainKind domain_kind) {
+  (void)seed;
   return std::make_unique<SyntheticProvider>(name, seed, domain_kind);
 }
 std::unique_ptr<Provider> make_host_memory_provider() {
@@ -228,113 +228,261 @@ std::unique_ptr<Provider> make_push_provider(const std::string& name) {
   return std::make_unique<PushProvider>(name);
 }
 
-// CUDA provider: dynamically loads the driver API for cuMemGetInfo/cudaMemGetInfo.
-// Never fabricates an accelerator observation; returns unavailable when CUDA is
-// not present. The driver handle is loaded once as a process-lifetime singleton.
+// ============================================================================
+// CUDA provider.
+//
+// Root cause note: cuMemGetInfo_v2 (driver API) requires a CUDA context to be
+// current on the calling thread. A typical fresh process has no context, so the
+// call returns CUDA_ERROR_INVALID_CONTEXT. We therefore retain the device's
+// PRIMARY context (cuDevicePrimaryCtxRetain) and bind it with cuCtxSetCurrent
+// before querying. The CUDA runtime (cudart64_*), when present, auto-creates a
+// context on first use and is preferred; it simply is not installed on every
+// machine. We never fabricate a value.
+// ============================================================================
 #if defined(_WIN32)
 namespace {
-struct CudaDriverAccess {
+
+struct CudaAccess {
+  bool is_runtime = false;
   HMODULE h = nullptr;
-  using MemGetInfo = int (*)(std::size_t*, std::size_t*);
-  using Init = int (*)(unsigned);
-  MemGetInfo memGetInfo = nullptr;
-  Init init = nullptr;
-  bool initialized = false;
-  bool loaded() const { return h != nullptr && memGetInfo != nullptr; }
-  ~CudaDriverAccess() {
+
+  using RMemGetInfo = int (*)(std::size_t*, std::size_t*);
+  using RSetDevice = int (*)(int);
+  using RSync = int (*)(void);
+  using RDeviceCount = int (*)(int*);
+  using RDeviceProps = int (*)(void*, int);
+  using RDriverVersion = int (*)(int*);
+  using RRuntimeVersion = int (*)(int*);
+  RMemGetInfo rMemGetInfo = nullptr;
+  RSetDevice rSetDevice = nullptr;
+  RSync rSync = nullptr;
+  RDeviceCount rDeviceCount = nullptr;
+  RDeviceProps rDeviceProps = nullptr;
+  RDriverVersion rDriverVersion = nullptr;
+  RRuntimeVersion rRuntimeVersion = nullptr;
+
+  using DMemGetInfo = int (*)(std::size_t*, std::size_t*);
+  using DInit = int (*)(unsigned);
+  using DDeviceCount = int (*)(int*);
+  using DDeviceGet = int (*)(int*, int);
+  using DDeviceName = int (*)(char*, int, int);
+  using DCtxRetain = int (*)(std::uint64_t*, int);
+  using DCtxSet = int (*)(std::uint64_t);
+  using DSync = int (*)(void);
+  using DDriverVersion = int (*)(int*);
+  using DGetErrorString = int (*)(int, const char**);
+  DMemGetInfo dMemGetInfo = nullptr;
+  DInit dInit = nullptr;
+  DDeviceCount dDeviceCount = nullptr;
+  DDeviceGet dDeviceGet = nullptr;
+  DDeviceName dDeviceName = nullptr;
+  DCtxRetain dCtxRetain = nullptr;
+  DCtxSet dCtxSet = nullptr;
+  DSync dSync = nullptr;
+  DDriverVersion dDriverVersion = nullptr;
+  DGetErrorString dGetErrorString = nullptr;
+
+  std::uint64_t context = 0;
+  bool context_ready = false;
+
+  bool loaded() const { return h != nullptr && (rMemGetInfo != nullptr || dMemGetInfo != nullptr); }
+
+  std::string error_string(int code) const {
+    if (is_runtime) {
+      using ErrStr = const char* (*)(int);
+      ErrStr f = reinterpret_cast<ErrStr>(GetProcAddress(h, "cudaGetErrorString"));
+      if (f) {
+        const char* s = f(code);
+        return s ? std::string(s) : std::string("unknown");
+      }
+    } else {
+      if (dGetErrorString) {
+        const char* s = nullptr;
+        if (dGetErrorString(code, &s) == 0 && s) return std::string(s);
+      }
+    }
+    return "unknown";
+  }
+
+  ~CudaAccess() {
     if (h) FreeLibrary(h);
   }
 };
 
-CudaDriverAccess load_cuda_driver() {
-  CudaDriverAccess d;
-  const char* candidates[] = {"cudart64_120.dll", "cudart64_110.dll",
-                              "cudart64_100.dll", "nvcuda.dll"};
-  for (const char* c : candidates) {
-    d.h = LoadLibraryA(c);
-    if (d.h) {
-      d.memGetInfo = reinterpret_cast<CudaDriverAccess::MemGetInfo>(
-          GetProcAddress(d.h, "cudaMemGetInfo"));
-      if (!d.memGetInfo) {
-        d.memGetInfo = reinterpret_cast<CudaDriverAccess::MemGetInfo>(
-            GetProcAddress(d.h, "cuMemGetInfo_v2"));
-      }
-      d.init = reinterpret_cast<CudaDriverAccess::Init>(GetProcAddress(d.h, "cuInit"));
-      // If we loaded the runtime library, cudaMemGetInfo auto-initializes; no
-      // separate cuInit is needed.
-      if (d.memGetInfo && std::strstr(c, "cudart")) d.initialized = true;
+template <typename T>
+T loadfn(HMODULE h, const char* name) {
+  return reinterpret_cast<T>(GetProcAddress(h, name));
+}
+
+CudaAccess load_cuda() {
+  CudaAccess a;
+  const char* rt_candidates[] = {"cudart64_120.dll", "cudart64_110.dll", "cudart64_100.dll"};
+  for (const char* c : rt_candidates) {
+    HMODULE h = LoadLibraryA(c);
+    if (h) {
+      a.h = h;
+      a.is_runtime = true;
+      a.rMemGetInfo = loadfn<CudaAccess::RMemGetInfo>(h, "cudaMemGetInfo");
+      a.rSetDevice = loadfn<CudaAccess::RSetDevice>(h, "cudaSetDevice");
+      a.rSync = loadfn<CudaAccess::RSync>(h, "cudaDeviceSynchronize");
+      a.rDeviceCount = loadfn<CudaAccess::RDeviceCount>(h, "cudaGetDeviceCount");
+      a.rDeviceProps = loadfn<CudaAccess::RDeviceProps>(h, "cudaGetDeviceProperties");
+      a.rDriverVersion = loadfn<CudaAccess::RDriverVersion>(h, "cudaDriverGetVersion");
+      a.rRuntimeVersion = loadfn<CudaAccess::RRuntimeVersion>(h, "cudaRuntimeGetVersion");
       break;
     }
   }
-  if (!d.loaded()) {
-    if (d.h) FreeLibrary(d.h);
-    d.h = nullptr;
-    d.memGetInfo = nullptr;
+  if (!a.h) {
+    HMODULE h = LoadLibraryA("nvcuda.dll");
+    if (h) {
+      a.h = h;
+      a.is_runtime = false;
+      a.dInit = loadfn<CudaAccess::DInit>(h, "cuInit");
+      a.dDeviceCount = loadfn<CudaAccess::DDeviceCount>(h, "cuDeviceGetCount");
+      a.dDeviceGet = loadfn<CudaAccess::DDeviceGet>(h, "cuDeviceGet");
+      a.dDeviceName = loadfn<CudaAccess::DDeviceName>(h, "cuDeviceGetName");
+      a.dMemGetInfo = loadfn<CudaAccess::DMemGetInfo>(h, "cuMemGetInfo_v2");
+      if (!a.dMemGetInfo) a.dMemGetInfo = loadfn<CudaAccess::DMemGetInfo>(h, "cuMemGetInfo");
+      a.dCtxRetain = loadfn<CudaAccess::DCtxRetain>(h, "cuDevicePrimaryCtxRetain");
+      a.dCtxSet = loadfn<CudaAccess::DCtxSet>(h, "cuCtxSetCurrent");
+      a.dSync = loadfn<CudaAccess::DSync>(h, "cuCtxSynchronize");
+      a.dDriverVersion = loadfn<CudaAccess::DDriverVersion>(h, "cuDriverGetVersion");
+      a.dGetErrorString = loadfn<CudaAccess::DGetErrorString>(h, "cuGetErrorString");
+    }
   }
-  return d;
+  if (!a.loaded()) {
+    if (a.h) FreeLibrary(a.h);
+    a.h = nullptr;
+  }
+  return a;
 }
 
-CudaDriverAccess& cuda_driver() {
-  static CudaDriverAccess d = load_cuda_driver();
-  return d;
+CudaAccess& cuda() {
+  static CudaAccess a = load_cuda();
+  return a;
 }
+
+std::string query_cuda(std::size_t& free_b, std::size_t& total_b, int& device_ordinal,
+                       std::string& device_name, std::string& driver_version,
+                       std::string& runtime_version) {
+  CudaAccess& a = cuda();
+  int rc = 0;
+  int dev_count = 0;
+  if (a.is_runtime) {
+    if (!a.rMemGetInfo) return "cudaMemGetInfo symbol missing";
+    rc = a.rDeviceCount ? a.rDeviceCount(&dev_count) : -1;
+    if (rc != 0) return "cudaGetDeviceCount: " + a.error_string(rc);
+    if (dev_count <= 0) return "no CUDA device present";
+    rc = a.rSetDevice ? a.rSetDevice(0) : -1;
+    if (rc != 0) return "cudaSetDevice(0): " + a.error_string(rc);
+    if (a.rSync) { rc = a.rSync(); if (rc != 0) return "cudaDeviceSynchronize: " + a.error_string(rc); }
+    rc = a.rMemGetInfo(&free_b, &total_b);
+    if (rc != 0) return "cudaMemGetInfo: " + a.error_string(rc);
+    device_ordinal = 0;
+    int dv = 0;
+    if (a.rDriverVersion) a.rDriverVersion(&dv);
+    driver_version = std::to_string(dv);
+    int rv = 0;
+    if (a.rRuntimeVersion) a.rRuntimeVersion(&rv);
+    runtime_version = std::to_string(rv);
+    if (a.rDeviceProps) {
+      struct Props { char name[256]; int major; int minor; int total_mem; int multi; };
+      Props p{};
+      if (a.rDeviceProps(&p, 0) == 0) device_name = p.name;
+    }
+    if (device_name.empty()) device_name = "cuda-device-0";
+    return "";
+  }
+
+  if (!a.dMemGetInfo) return "cuMemGetInfo symbol missing";
+  rc = a.dInit ? a.dInit(0) : -1;
+  if (rc != 0) return "cuInit: " + a.error_string(rc);
+  rc = a.dDeviceCount ? a.dDeviceCount(&dev_count) : -1;
+  if (rc != 0) return "cuDeviceGetCount: " + a.error_string(rc);
+  if (dev_count <= 0) return "no CUDA device present";
+  int dev = 0;
+  rc = a.dDeviceGet ? a.dDeviceGet(&dev, 0) : -1;
+  if (rc != 0) return "cuDeviceGet(0): " + a.error_string(rc);
+  if (!a.context_ready) {
+    if (!a.dCtxRetain) return "cuDevicePrimaryCtxRetain symbol missing";
+    rc = a.dCtxRetain(&a.context, 0);
+    if (rc != 0) return "cuDevicePrimaryCtxRetain: " + a.error_string(rc);
+    a.context_ready = true;
+  }
+  rc = a.dCtxSet ? a.dCtxSet(a.context) : -1;
+  if (rc != 0) return "cuCtxSetCurrent: " + a.error_string(rc);
+  rc = a.dMemGetInfo(&free_b, &total_b);
+  if (rc != 0) return "cuMemGetInfo_v2: " + a.error_string(rc);
+  device_ordinal = dev;
+  char nm[256] = {};
+  if (a.dDeviceName) a.dDeviceName(nm, sizeof(nm), dev);
+  device_name = nm[0] ? std::string(nm) : "cuda-device-0";
+  int dv = 0;
+  if (a.dDriverVersion) a.dDriverVersion(&dv);
+  driver_version = std::to_string(dv);
+  runtime_version = "n/a (runtime not loaded; using cuda driver API)";
+  return "";
+}
+
 }  // namespace
 #endif
-std::unique_ptr<Provider> make_cuda_provider() {
-#if defined(_WIN32)
-  if (!cuda_driver().loaded()) {
-    return nullptr;  // backend unavailable -> no fabricated observation
-  }
-  struct CudaProvider final : public Provider {
-    std::string name() const override { return "cuda"; }
-    std::string kind() const override { return "cuda"; }
-    std::string provider_version() const override { return "dynamic"; }
-    DomainKind primary_domain() const override { return DomainKind::kAcceleratorDevice; }
-    bool available() const override { return cuda_driver().loaded(); }
-    CollectResult collect() override {
-      CollectResult r;
-      CudaDriverAccess& d = cuda_driver();
-      if (!d.loaded()) {
-        r.ok = false;
-        r.error = Error{ErrorCode::kNoBackend, "CUDA backend unavailable"};
-        return r;
+
+class CudaProvider final : public Provider {
+ public:
+  std::string name() const override { return "cuda"; }
+  std::string kind() const override { return "cuda"; }
+  std::string provider_version() const override { return "cuda-provider-1.0"; }
+  DomainKind primary_domain() const override { return DomainKind::kAcceleratorDevice; }
+  bool available() const override { return cuda().loaded(); }
+  CollectResult collect() override {
+    CollectResult r;
+    std::size_t free_b = 0, total_b = 0;
+    int ordinal = 0;
+    std::string dev_name, drv_ver, rt_ver;
+    std::string err = query_cuda(free_b, total_b, ordinal, dev_name, drv_ver, rt_ver);
+    if (!err.empty()) {
+      ErrorCode code = ErrorCode::kBackendUnavailable;
+      if (err.find("no CUDA device") != std::string::npos ||
+          err.find("symbol missing") != std::string::npos) {
+        code = ErrorCode::kNoBackend;
+      } else {
+        code = ErrorCode::kProviderError;
       }
-      if (!d.initialized) {
-        if (!d.init) {
-          r.ok = false;
-          r.error = Error{ErrorCode::kProviderError, "CUDA driver lacks cuInit"};
-          return r;
-        }
-        if (d.init(0) != 0) {
-          r.ok = false;
-          r.error = Error{ErrorCode::kProviderError, "cuInit failed"};
-          return r;
-        }
-        d.initialized = true;
-      }
-      std::size_t free_b = 0, total_b = 0;
-      const int rc = d.memGetInfo(&free_b, &total_b);
-      if (rc != 0) {
-        r.ok = false;
-        r.error = Error{ErrorCode::kProviderError, "cuMemGetInfo failed"};
-        return r;
-      }
-      r.ok = true;
-      Sample avail;
-      avail.domain_kind = DomainKind::kAcceleratorDevice;
-      avail.kind = MemoryKind::kAvailable;
-      avail.scale = Scale::kBytes;
-      avail.gauge_value = static_cast<double>(free_b);
-      r.samples.push_back(std::move(avail));
-      Sample total;
-      total.domain_kind = DomainKind::kAcceleratorDevice;
-      total.kind = MemoryKind::kPhysical;
-      total.scale = Scale::kBytes;
-      total.gauge_value = static_cast<double>(total_b);
-      r.samples.push_back(std::move(total));
+      r.ok = false;
+      r.error = Error{code, err};
       return r;
     }
-  };
+    r.ok = true;
+    std::vector<Annotation> ann = {
+        {"device_ordinal", std::to_string(ordinal)},
+        {"device_name", dev_name},
+        {"driver_version", drv_ver},
+        {"runtime_version", rt_ver},
+        {"cuda_backend", cuda().is_runtime ? "cuda_runtime" : "cuda_driver"},
+    };
+    Sample avail;
+    avail.domain_kind = DomainKind::kAcceleratorDevice;
+    avail.kind = MemoryKind::kAvailable;
+    avail.scale = Scale::kBytes;
+    avail.gauge_value = static_cast<double>(free_b);
+    avail.annotations = ann;
+    r.samples.push_back(std::move(avail));
+    Sample total;
+    total.domain_kind = DomainKind::kAcceleratorDevice;
+    total.kind = MemoryKind::kPhysical;
+    total.scale = Scale::kBytes;
+    total.gauge_value = static_cast<double>(total_b);
+    total.annotations = std::move(ann);
+    r.samples.push_back(std::move(total));
+    return r;
+  }
+};
+
+std::unique_ptr<Provider> make_cuda_provider() {
+#if defined(_WIN32)
+  if (!cuda().loaded()) {
+    return nullptr;  // no CUDA backend -> no fabricated observation
+  }
   return std::make_unique<CudaProvider>();
 #else
   return nullptr;
@@ -342,4 +490,3 @@ std::unique_ptr<Provider> make_cuda_provider() {
 }
 
 }  // namespace memory_observatory
-

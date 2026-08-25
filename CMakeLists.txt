@@ -36,6 +36,7 @@ set(MEMORY_OBSERVATORY_SOURCES
     src/observatory.cpp
     src/trace.cpp
     src/report.cpp
+    src/compare.cpp
     src/providers.cpp
     src/sampler.cpp)
 

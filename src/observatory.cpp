@@ -805,7 +805,12 @@ IngestResult Observatory::observe(Observation observation) {
       }
       SourceInfo info;
       info.id = observation.source;
-      info.name = "ephemeral-" + std::to_string(observation.source.value());
+      // Honor an explicit provenance source name so cross-process source identity
+      // is preserved when a producer's observations are ingested by a fresh
+      // Observatory that has never seen this source.
+      info.name = !observation.provenance.source_name.empty()
+                      ? observation.provenance.source_name
+                      : "ephemeral-" + std::to_string(observation.source.value());
       info.kind = "ephemeral";
       info.health = SourceHealth::kUnknown;
       src_it = impl_->sources_.emplace(observation.source, std::move(info)).first;

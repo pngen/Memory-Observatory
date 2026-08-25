@@ -1,0 +1,57 @@
+# Build directories
+build/
+build-*/
+out/
+cmake-build-*/
+_install/
+_install-*/
+_consumer/
+_consumer-*/
+downstream/_build/
+downstream/build/
+
+# CMake generated
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+install_manifest.txt
+*.cmake.user
+
+# Generated build artifacts
+*.o
+*.obj
+*.exe
+*.dll
+*.lib
+*.pdb
+*.ilk
+*.exp
+*.idb
+*.tlog
+*.lastbuildstate
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.suo
+*.user
+*.sln
+*.vcxproj
+*.filters
+
+# Editor temp
+*.swp
+*.tmp
+*~
+
+# Test artifacts
+*.trace
+*.trace.json
+*.json.tmp
+
+# OS
+Thumbs.db
+.DS_Store

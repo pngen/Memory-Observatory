@@ -76,4 +76,4 @@ All commands support `--help` (run `memory-observatory` with no args), strict ar
 
 ## License
 
-Apache-2.0. Copyright 2026 Summon Software Labs. See `LICENSE` and `NOTICE`.
+Apache License 2.0. Copyright 2026 Summon Software Labs. No telemetry transmission.

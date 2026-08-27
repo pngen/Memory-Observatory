@@ -77,7 +77,3 @@ All commands support `--help` (run `memory-observatory` with no args), strict ar
 ## License
 
 Apache-2.0. Copyright 2026 Summon Software Labs. See `LICENSE` and `NOTICE`.
-
-## Honesty
-
-Memory Observatory does not claim production readiness beyond what is tested, platform support beyond what is validated, backend support beyond what is implemented, causal diagnosis when only correlation exists, leak certainty from heuristics, fragmentation numbers without provider evidence, exact global ordering when only source-local ordering is guaranteed, zero event loss unless tested, arbitrary scale, or distributed support. It prefers explicit limitations. See `LIMITATIONS.md`.

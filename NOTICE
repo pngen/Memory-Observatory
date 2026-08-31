@@ -2,17 +2,15 @@ Memory Observatory
 
 Copyright © Summon Software Labs
 
-Memory Observatory is an open-source, vendor-neutral observability runtime for
-measuring, correlating, explaining, and replaying memory behavior across
-heterogeneous AI infrastructure.
+Memory Observatory is an open-source, vendor-neutral observability runtime for measuring, correlating, explaining, and replaying memory behavior across heterogeneous AI infrastructure.
 
 This product is licensed under the Apache License, Version 2.0. See the
 LICENSE file in this distribution for the full license text.
 
-Memory Observatory does not transmit any telemetry. All measurements and
-telemetry are written to local files chosen by the operator and never leave
-the machine running the software.
+Memory Observatory does not collect or transmit any telemetry. All telemetry is
+written to local files chosen by the operator and never leaves the machine
+running the software.
 
-Memory Observatory accepts contributions from individuals and organizations on
-the terms of the Apache License 2.0 without requiring a Contributor License
+Memory Observatory accepts contributions from individuals and organizations on the
+terms of the Apache License 2.0 without requiring a Contributor License
 Agreement (CLA). See CONTRIBUTING.md for contribution guidance.

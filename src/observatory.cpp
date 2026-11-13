@@ -133,6 +133,37 @@ Diagnostic make_diagnostic(DiagnosticCode code, DiagnosticSeverity sev,
   return d;
 }
 
+// When each source was last heard from, on this process's own steady clock. An
+// observation's timestamp belongs to its producer: a replayed trace or a
+// producer on another machine is in a different clock domain, so whether a
+// source has gone quiet is measured from when its observations arrived here.
+using ArrivalMap =
+    std::unordered_map<SourceId, MonotonicTimestamp, IdHash<SourceTag>>;
+
+// How long a source has been silent. Unknown (nullopt) for a source that was
+// removed or has not produced anything yet.
+std::optional<Duration> silence_of(const SourceInfo& si, const ArrivalMap& arrivals,
+                                   MonotonicTimestamp now) {
+  if (si.health == SourceHealth::kRemoved || !si.last_observation_known) {
+    return std::nullopt;
+  }
+  const auto it = arrivals.find(si.id);
+  if (it == arrivals.end()) {
+    return std::nullopt;
+  }
+  return now - it->second;
+}
+
+// History is kept in arrival order and out-of-order arrival is accepted by
+// default, while the diagnostic rules read each series in time order. Puts a
+// span in monotonic order, keeping arrival order between equal timestamps.
+void order_by_time(std::vector<Observation>& span) {
+  std::stable_sort(span.begin(), span.end(),
+                   [](const Observation& a, const Observation& b) {
+                     return a.timestamp.monotonic < b.timestamp.monotonic;
+                   });
+}
+
 }  // namespace
 
 // ============================================================================
@@ -144,6 +175,7 @@ namespace {
 std::vector<Diagnostic> run_diagnostics(
     const std::vector<Observation>& span,
     const std::unordered_map<SourceId, SourceInfo, IdHash<SourceTag>>& sources,
+    const ArrivalMap& arrivals,
     const AccountingCounters& counters, const DiagnosticConfig& cfg,
     const std::unordered_map<DomainId, MemoryDomain, IdHash<DomainTag>>& domains,
     MonotonicTimestamp now) {
@@ -152,6 +184,9 @@ std::vector<Diagnostic> run_diagnostics(
   // ---- Staleness, per source --------------------------------------------
   for (const auto& kv : sources) {
     const SourceInfo& si = kv.second;
+    if (si.health == SourceHealth::kRemoved) {
+      continue;  // a removed source is neither missing nor stale
+    }
     if (!si.last_observation_known) {
       // A registered source that never produced anything.
       Diagnostic d = make_diagnostic(DiagnosticCode::kMissingProvider,
@@ -167,8 +202,9 @@ std::vector<Diagnostic> run_diagnostics(
       out.push_back(std::move(d));
       continue;
     }
-    const Duration age = now - si.last_observation;
-    if (si.health != SourceHealth::kRemoved && age > cfg.stale_after) {
+    const std::optional<Duration> silence = silence_of(si, arrivals, now);
+    if (silence && *silence > cfg.stale_after) {
+      const Duration age = *silence;
       Diagnostic d = make_diagnostic(DiagnosticCode::kStaleTelemetry,
                                      DiagnosticSeverity::kWarning,
                                      DiagnosticKind::kMeasuredFact,
@@ -347,8 +383,18 @@ std::vector<Diagnostic> run_diagnostics(
         out.push_back(std::move(d));
       }
 
-      // Rapid growth: large jump over a short window.
-      if (frac >= cfg.rapid_growth_ratio && n >= cfg.rapid_growth_window) {
+      // Rapid growth: a large jump across the most recent rapid_growth_window
+      // samples. Growth across the whole retained span is the sustained rule.
+      const std::size_t rapid_window =
+          std::max<std::size_t>(cfg.rapid_growth_window, 2);
+      double rapid_growth = 0.0;
+      double rapid_frac = 0.0;
+      if (n >= rapid_window) {
+        const double from = series[n - rapid_window].v;
+        rapid_growth = last - from;
+        rapid_frac = std::fabs(from) > 1e-9 ? rapid_growth / std::fabs(from) : 0.0;
+      }
+      if (n >= rapid_window && rapid_frac >= cfg.rapid_growth_ratio) {
         Diagnostic d = make_diagnostic(DiagnosticCode::kRapidGrowth,
                                        DiagnosticSeverity::kCritical,
                                        DiagnosticKind::kDerivedStatistic,
@@ -357,14 +403,14 @@ std::vector<Diagnostic> run_diagnostics(
         d.domain = domain;
         DiagnosticEvidence ev;
         ev.description = std::string(to_string(kind)) + " grew " +
-                         fmt_ratio(frac) + " fractionally";
+                         fmt_ratio(rapid_frac) + " fractionally";
         ev.domain = domain;
         ev.kind = kind;
-        ev.delta = growth;
+        ev.delta = rapid_growth;
         d.evidence.push_back(ev);
         d.explanation =
             "The '" + std::string(to_string(kind)) +
-            "' series increased by " + fmt_ratio(frac) +
+            "' series increased by " + fmt_ratio(rapid_frac) +
             " fractionally within a short window, exceeding the rapid-growth "
             "threshold. This is a derived statistic, not a causal claim.";
         out.push_back(std::move(d));
@@ -627,11 +673,15 @@ struct Observatory::Impl {
 
   mutable std::mutex mutex_;
   std::deque<Observation> history_;
+  // Parallel to history_: whether the producer supplied that observation's id.
+  std::deque<bool> history_supplied_id_;
 
+  // Ids that producers supplied, tracked for duplicate suppression.
   std::unordered_set<ObservationId, IdHash<ObservationTag>> dedup_set_;
   std::deque<ObservationId> dedup_order_;
 
   std::unordered_map<SourceId, SourceInfo, IdHash<SourceTag>> sources_;
+  ArrivalMap arrivals_;
   std::unordered_map<DomainId, MemoryDomain, IdHash<DomainTag>> domains_;
 
   AccountingCounters counters_;
@@ -640,7 +690,14 @@ struct Observatory::Impl {
   std::unordered_map<SubscriptionId, SubscriberFn, IdHash<SubscriptionTag>>
       subscribers_;
 
-  std::uint64_t mint_observation_id() noexcept { return next_observation_id++; }
+  // Mints the next observation id, passing over any id a producer supplied that
+  // is still tracked, so a minted id never reads as a duplicate of it.
+  std::uint64_t mint_observation_id() {
+    while (dedup_set_.count(ObservationId{next_observation_id}) != 0) {
+      ++next_observation_id;
+    }
+    return next_observation_id++;
+  }
 };
 
 // ============================================================================
@@ -674,6 +731,11 @@ Result<SourceId> Observatory::register_source(const SourceDescriptor& desc) {
   std::lock_guard<std::mutex> lock(impl_->mutex_);
   if (impl_->sources_.size() >= impl_->config.max_sources) {
     return fail<SourceId>(ErrorCode::kBoundExceeded, "source limit reached");
+  }
+  // Ids are also taken by sources registered on first sight of an observation;
+  // one that is already in use is never handed out again.
+  while (impl_->sources_.count(SourceId{impl_->next_source_id}) != 0) {
+    ++impl_->next_source_id;
   }
   const SourceId id{impl_->next_source_id++};
   SourceInfo info;
@@ -773,13 +835,6 @@ std::vector<MemoryDomain> Observatory::domains() const {
 // ============================================================================
 
 IngestResult Observatory::observe(Observation observation) {
-  if (observation.source == SourceId{}) {
-    IngestResult r;
-    r.outcome = IngestOutcome::kRejectedInvalid;
-    r.reason = "observation has no source";
-    return r;
-  }
-
   IngestResult result;
   result.id = observation.id;
 
@@ -788,21 +843,81 @@ IngestResult Observatory::observe(Observation observation) {
 
   {
     std::lock_guard<std::mutex> lock(impl_->mutex_);
+    AccountingCounters& counters = impl_->counters_;
 
-    if (!observation.id.valid()) {
+    // Every observation offered to the pipeline is counted under exactly one
+    // disposition, including the ones refused before anything else is looked at.
+    const auto refuse = [&](IngestOutcome outcome, std::uint64_t& reason_counter,
+                            const char* reason) {
+      result.outcome = outcome;
+      result.reason = reason;
+      ++reason_counter;
+      ++counters.ingested_total;
+    };
+
+    if (!observation.source.valid()) {
+      refuse(IngestOutcome::kRejectedInvalid, counters.rejected_invalid,
+             "observation has no source");
+      return result;
+    }
+    if (observation.payload.index() == 0) {
+      refuse(IngestOutcome::kRejectedMalformed, counters.rejected_malformed,
+             "observation has no payload");
+      return result;
+    }
+
+    auto src_it = impl_->sources_.find(observation.source);
+    const bool known_source = src_it != impl_->sources_.end();
+    if (!known_source && impl_->sources_.size() >= impl_->config.max_sources) {
+      refuse(IngestOutcome::kRejectedInvalid, counters.rejected_invalid,
+             "unknown source and source limit reached");
+      return result;
+    }
+    if (known_source && src_it->second.health == SourceHealth::kRemoved) {
+      refuse(IngestOutcome::kRejectedInvalid, counters.rejected_invalid,
+             "source has been removed");
+      return result;
+    }
+
+    // Duplicate suppression compares the ids that producers supplied. An id
+    // minted here is new by construction and is never a duplicate of anything.
+    const bool supplied_id = observation.id.valid();
+    if (supplied_id && impl_->config.deduplicate_ids &&
+        impl_->dedup_set_.count(observation.id) != 0) {
+      refuse(IngestOutcome::kDuplicateSuppressed, counters.duplicate_suppressed,
+             "duplicate observation id");
+      return result;
+    }
+
+    // An observation naming an older generation than its source has reached
+    // comes from before the source's last reset.
+    const bool superseded =
+        known_source && observation.generation != Generation{} &&
+        observation.generation < src_it->second.generation;
+    if (impl_->config.reject_stale &&
+        (observation.freshness.stale || superseded)) {
+      refuse(IngestOutcome::kRejectedStale, counters.rejected_stale,
+             superseded ? "observation from a superseded source generation"
+                        : "stale observation rejected by configuration");
+      return result;
+    }
+
+    if (impl_->config.reject_out_of_order && known_source &&
+        src_it->second.last_observation_known &&
+        observation.timestamp.monotonic < src_it->second.last_observation) {
+      refuse(IngestOutcome::kRejectedOutOfOrder, counters.rejected_out_of_order,
+             "observation older than source's last accepted monotonic time");
+      return result;
+    }
+
+    // Accept. Nothing above changed any state, so a refused observation leaves
+    // the registry, its source and the id sequence exactly as they were.
+    if (!supplied_id) {
       observation.id = ObservationId{impl_->mint_observation_id()};
       result.id = observation.id;
     }
 
-    auto src_it = impl_->sources_.find(observation.source);
-    if (src_it == impl_->sources_.end()) {
-      if (impl_->sources_.size() >= impl_->config.max_sources) {
-        result.outcome = IngestOutcome::kRejectedInvalid;
-        result.reason = "unknown source and source limit reached";
-        ++impl_->counters_.rejected_invalid;
-        ++impl_->counters_.ingested_total;
-        return result;
-      }
+    if (!known_source) {
       SourceInfo info;
       info.id = observation.source;
       // Honor an explicit provenance source name so cross-process source identity
@@ -815,93 +930,69 @@ IngestResult Observatory::observe(Observation observation) {
       info.health = SourceHealth::kUnknown;
       src_it = impl_->sources_.emplace(observation.source, std::move(info)).first;
     }
-
-    if (impl_->config.deduplicate_ids &&
-        impl_->dedup_set_.count(observation.id) != 0) {
-      result.outcome = IngestOutcome::kDuplicateSuppressed;
-      result.reason = "duplicate observation id";
-      ++impl_->counters_.duplicate_suppressed;
-      ++impl_->counters_.ingested_total;
-      return result;
-    }
-
     SourceInfo& source = src_it->second;
-    if (observation.generation != Generation{} && source.last_observation_known &&
-        observation.generation != source.generation) {
-      if (source.generation != Generation{} &&
-          observation.generation > source.generation) {
+
+    // A source's generation only moves forward.
+    if (observation.generation > source.generation) {
+      if (source.generation != Generation{} && source.last_observation_known) {
         ++source.generation_rollovers;
       }
-    }
-    if (observation.generation != Generation{}) {
       source.generation = observation.generation;
     }
 
-    if (impl_->config.reject_stale && observation.freshness.stale) {
-      result.outcome = IngestOutcome::kRejectedStale;
-      result.reason = "stale observation rejected by configuration";
-      ++impl_->counters_.rejected_stale;
-      ++impl_->counters_.ingested_total;
-      return result;
-    }
-
-    if (impl_->config.reject_out_of_order && source.last_observation_known &&
-        observation.timestamp.monotonic < source.last_observation) {
-      result.outcome = IngestOutcome::kRejectedOutOfOrder;
-      result.reason = "observation older than source's last accepted monotonic time";
-      ++impl_->counters_.rejected_out_of_order;
-      ++impl_->counters_.ingested_total;
-      return result;
-    }
-
-    // Accept.
-    if (impl_->config.deduplicate_ids) {
+    if (supplied_id && impl_->config.deduplicate_ids) {
       impl_->dedup_set_.insert(observation.id);
       impl_->dedup_order_.push_back(observation.id);
-    }
-
-    if (impl_->history_.size() >= impl_->config.history_capacity) {
-      const ObservationId evicted_id = impl_->history_.front().id;
-      impl_->history_.pop_front();
-      ++impl_->counters_.evicted;
-      if (impl_->counters_.retained > 0) {
-        --impl_->counters_.retained;
-      }
-      auto oit = std::find(impl_->dedup_order_.begin(), impl_->dedup_order_.end(),
-                           evicted_id);
-      if (oit != impl_->dedup_order_.end()) {
-        impl_->dedup_set_.erase(evicted_id);
-        impl_->dedup_order_.erase(oit);
+      const std::size_t dedup_cap =
+          std::max<std::size_t>(impl_->config.dedup_capacity, 1);
+      while (impl_->dedup_order_.size() > dedup_cap) {
+        impl_->dedup_set_.erase(impl_->dedup_order_.front());
+        impl_->dedup_order_.pop_front();
       }
     }
 
-    const std::size_t dedup_cap =
-        std::max<std::size_t>(impl_->config.dedup_capacity, 1);
-    while (!impl_->dedup_order_.empty() &&
-           impl_->dedup_order_.size() > dedup_cap) {
-      const ObservationId old = impl_->dedup_order_.front();
-      impl_->dedup_order_.pop_front();
-      impl_->dedup_set_.erase(old);
-    }
+    const MonotonicTimestamp stamp = observation.timestamp.monotonic;
+    const bool event = is_event(observation);
 
     dispatch_obs = observation;
     impl_->history_.push_back(std::move(observation));
+    impl_->history_supplied_id_.push_back(supplied_id);
+    ++counters.retained;
+
+    // Bounded history: the oldest retained observations make room. A capacity
+    // of zero retains nothing, so the observation just accepted is evicted.
+    while (impl_->history_.size() > impl_->config.history_capacity) {
+      const ObservationId evicted_id = impl_->history_.front().id;
+      const bool evicted_supplied = impl_->history_supplied_id_.front();
+      impl_->history_.pop_front();
+      impl_->history_supplied_id_.pop_front();
+      ++counters.evicted;
+      --counters.retained;
+      if (evicted_supplied && impl_->dedup_set_.erase(evicted_id) != 0) {
+        auto oit = std::find(impl_->dedup_order_.begin(),
+                             impl_->dedup_order_.end(), evicted_id);
+        if (oit != impl_->dedup_order_.end()) {
+          impl_->dedup_order_.erase(oit);
+        }
+      }
+    }
 
     source.observations_ingested += 1;
-    if (is_event(impl_->history_.back())) {
+    if (event) {
       source.events_ingested += 1;
+      source.last_event = stamp;
     }
-    source.last_observation = impl_->history_.back().timestamp.monotonic;
+    source.last_observation = stamp;
     source.last_observation_known = true;
     if (!source.first_observation) {
-      source.first_observation = impl_->history_.back().timestamp.monotonic;
+      source.first_observation = stamp;
     }
     if (source.health == SourceHealth::kUnknown) {
       source.health = SourceHealth::kHealthy;
     }
+    impl_->arrivals_[source.id] = MonotonicTimestamp::now();
 
-    ++impl_->counters_.retained;
-    ++impl_->counters_.ingested_total;
+    ++counters.ingested_total;
 
     // Copy subscriber functions under their own lock only.
     std::lock_guard<std::mutex> slock(impl_->sub_mutex_);
@@ -913,9 +1004,14 @@ IngestResult Observatory::observe(Observation observation) {
     result.outcome = IngestOutcome::kAccepted;
   }
 
-  // Dispatch OUTSIDE the history lock and outside the subscriber lock.
+  // Dispatch OUTSIDE the history lock and outside the subscriber lock. A
+  // subscriber that throws does not take the ingestion result, or the other
+  // subscribers' delivery, down with it.
   for (const auto& fn : fns) {
-    fn(dispatch_obs);
+    try {
+      fn(dispatch_obs);
+    } catch (...) {
+    }
   }
 
   return result;
@@ -946,9 +1042,15 @@ std::size_t Observatory::retained_count() const noexcept {
 
 Result<Timeline> Observatory::query_timeline(const TimelineFilter& filter) const {
   std::lock_guard<std::mutex> lock(impl_->mutex_);
-  std::vector<TimelineEntry> matched;
-  matched.reserve(std::min<std::size_t>(impl_->history_.size(),
-                                        impl_->config.history_capacity));
+  Timeline tl;
+  // Every retained observation belongs to this Observatory's session.
+  if (filter.session && *filter.session != impl_->session) {
+    return ok(std::move(tl));
+  }
+  const std::string trace_value =
+      filter.trace ? std::to_string(filter.trace->value()) : std::string();
+
+  std::vector<const Observation*> matched;
   for (const auto& obs : impl_->history_) {
     if (filter.domain && obs.domain != *filter.domain) continue;
     if (filter.object && obs.object != *filter.object) continue;
@@ -956,10 +1058,10 @@ Result<Timeline> Observatory::query_timeline(const TimelineFilter& filter) const
     if (filter.device && obs.device != *filter.device) continue;
     if (filter.source && obs.source != *filter.source) continue;
     if (filter.trace) {
-      // Trace provenance is carried as an annotation if present.
+      // Trace provenance is carried as a "trace_id" annotation naming the trace.
       bool in_trace = false;
       for (const auto& a : obs.annotations) {
-        if (a.key == "trace_id") {
+        if (a.key == "trace_id" && a.value == trace_value) {
           in_trace = true;
           break;
         }
@@ -980,22 +1082,25 @@ Result<Timeline> Observatory::query_timeline(const TimelineFilter& filter) const
     if (filter.window && !filter.window->contains(obs.timestamp.monotonic)) {
       continue;
     }
-    TimelineEntry entry;
-    entry.observation = obs;
-    matched.push_back(std::move(entry));
-    if (filter.max_results != 0 && matched.size() >= filter.max_results) {
-      break;
-    }
+    matched.push_back(&obs);
   }
 
+  // Chronological order first, then the cap: a capped result is the earliest
+  // max_results matches rather than whichever ones happened to arrive first.
   std::stable_sort(matched.begin(), matched.end(),
-                   [](const TimelineEntry& a, const TimelineEntry& b) {
-                     return a.observation.timestamp.monotonic <
-                            b.observation.timestamp.monotonic;
+                   [](const Observation* a, const Observation* b) {
+                     return a->timestamp.monotonic < b->timestamp.monotonic;
                    });
+  if (filter.max_results != 0 && matched.size() > filter.max_results) {
+    matched.resize(filter.max_results);
+  }
 
-  Timeline tl;
-  tl.entries = std::move(matched);
+  tl.entries.reserve(matched.size());
+  for (const Observation* obs : matched) {
+    TimelineEntry entry;
+    entry.observation = *obs;
+    tl.entries.push_back(std::move(entry));
+  }
   tl.matched_count = static_cast<std::uint64_t>(tl.entries.size());
   return ok(std::move(tl));
 }
@@ -1038,6 +1143,7 @@ Result<WindowedResult> Observatory::aggregate_timeline(
 Result<Snapshot> Observatory::snapshot(const SnapshotFilter& filter) const {
   Snapshot snap;
   std::vector<Observation> span;
+  ArrivalMap arrivals;
 
   {
     std::lock_guard<std::mutex> lock(impl_->mutex_);
@@ -1049,27 +1155,35 @@ Result<Snapshot> Observatory::snapshot(const SnapshotFilter& filter) const {
     snap.observation_count = static_cast<std::uint64_t>(impl_->history_.size());
     snap.counters = impl_->counters_;
 
-    // Latest DomainState per domain.
-    std::map<DomainId, DomainState> latest_domains;
+    // Latest DomainState per domain: the newest by monotonic time, arrival
+    // order deciding between equal timestamps. whole_system takes precedence
+    // over the per-domain and per-source subsets.
+    std::map<DomainId, std::pair<MonotonicTimestamp, DomainState>> latest_domains;
     for (const auto& obs : impl_->history_) {
-      if (filter.whole_system || filter.domain || filter.source) {
-        if (filter.source && obs.source != *filter.source) continue;
+      if (!filter.whole_system && filter.source && obs.source != *filter.source) {
+        continue;
       }
       if (const auto* ds = std::get_if<DomainState>(&obs.payload)) {
-        latest_domains[obs.domain] = *ds;
+        auto found = latest_domains.find(obs.domain);
+        if (found == latest_domains.end()) {
+          latest_domains.emplace(obs.domain,
+                                 std::make_pair(obs.timestamp.monotonic, *ds));
+        } else if (obs.timestamp.monotonic >= found->second.first) {
+          found->second = std::make_pair(obs.timestamp.monotonic, *ds);
+        }
       }
     }
     for (const auto& kv : latest_domains) {
-      if (filter.whole_system == false && filter.domain &&
-          kv.first != *filter.domain) {
+      if (!filter.whole_system && filter.domain && kv.first != *filter.domain) {
         continue;
       }
-      snap.domains.push_back(kv.second);
+      snap.domains.push_back(kv.second.second);
     }
 
     for (const auto& kv : impl_->sources_) {
       snap.sources.push_back(kv.second);
     }
+    arrivals = impl_->arrivals_;
 
     // Copy a bounded span for diagnostics (the engine only needs the tail).
     const std::size_t cap = std::min<std::size_t>(impl_->history_.size(), 4096);
@@ -1088,10 +1202,14 @@ Result<Snapshot> Observatory::snapshot(const SnapshotFilter& filter) const {
     src_map[si.id] = si;
   }
   std::unordered_map<DomainId, MemoryDomain, IdHash<DomainTag>> domain_map;
-  snap.active_diagnostics = run_diagnostics(span, src_map, snap.counters,
-                                            impl_->config.diagnostics,
-                                            domain_map,
-                                            MonotonicTimestamp::now());
+  const DiagnosticConfig& dcfg = impl_->config.diagnostics;
+  const MonotonicTimestamp now = MonotonicTimestamp::now();
+  if (dcfg.enabled) {
+    order_by_time(span);
+    snap.active_diagnostics = run_diagnostics(span, src_map, arrivals,
+                                              snap.counters, dcfg, domain_map,
+                                              now);
+  }
 
   // Provenance/confidence/freshness summary from the active sources.
   for (const auto& si : snap.sources) {
@@ -1104,8 +1222,14 @@ Result<Snapshot> Observatory::snapshot(const SnapshotFilter& filter) const {
   }
   snap.confidence_summary = Confidence{0.5};
   snap.freshness_summary = Freshness{};
+  // A source counts as stale when it is marked so, or when it has been silent
+  // for longer than the staleness rule allows (the rule the diagnostics use).
   for (const auto& si : snap.sources) {
-    if (si.health == SourceHealth::kStale || si.health == SourceHealth::kFailed) {
+    const std::optional<Duration> silence = silence_of(si, arrivals, now);
+    const bool silent_too_long =
+        dcfg.enabled && silence && *silence > dcfg.stale_after;
+    if (si.health == SourceHealth::kStale || si.health == SourceHealth::kFailed ||
+        silent_too_long) {
       ++snap.stale_sources;
     }
   }
@@ -1117,9 +1241,13 @@ Result<Snapshot> Observatory::snapshot(const SnapshotFilter& filter) const {
 // ============================================================================
 
 std::vector<Diagnostic> Observatory::evaluate_diagnostics() const {
+  if (!impl_->config.diagnostics.enabled) {
+    return {};
+  }
   std::vector<Observation> span;
   std::unordered_map<SourceId, SourceInfo, IdHash<SourceTag>> src_map;
   std::unordered_map<DomainId, MemoryDomain, IdHash<DomainTag>> domain_map;
+  ArrivalMap arrivals;
   AccountingCounters cnt;
   {
     std::lock_guard<std::mutex> lock(impl_->mutex_);
@@ -1138,13 +1266,19 @@ std::vector<Diagnostic> Observatory::evaluate_diagnostics() const {
     for (const auto& kv : impl_->domains_) {
       domain_map[kv.first] = kv.second;
     }
+    arrivals = impl_->arrivals_;
     cnt = impl_->counters_;
   }
-  return run_diagnostics(span, src_map, cnt, impl_->config.diagnostics, domain_map,
-                         MonotonicTimestamp::now());
+  order_by_time(span);
+  return run_diagnostics(span, src_map, arrivals, cnt, impl_->config.diagnostics,
+                         domain_map, MonotonicTimestamp::now());
 }
 
 std::vector<Correlation> Observatory::evaluate_correlations() const {
+  if (!impl_->config.diagnostics.enabled ||
+      !impl_->config.diagnostics.correlation_enabled) {
+    return {};
+  }
   std::vector<Observation> span;
   {
     std::lock_guard<std::mutex> lock(impl_->mutex_);
@@ -1158,6 +1292,7 @@ std::vector<Correlation> Observatory::evaluate_correlations() const {
       }
     }
   }
+  order_by_time(span);
   auto diagnostics = evaluate_diagnostics();
   return run_correlations(span, diagnostics);
 }
@@ -1204,6 +1339,9 @@ ExplainResult Observatory::explain(DiagnosticCode code) const {
 // ============================================================================
 
 SubscriptionId Observatory::subscribe(SubscriberFn fn) {
+  if (!fn) {
+    return SubscriptionId{};  // nothing to call: no subscription is created
+  }
   std::lock_guard<std::mutex> lock(impl_->sub_mutex_);
   const SubscriptionId id{impl_->next_subscription_id++};
   impl_->subscribers_[id] = std::move(fn);
@@ -1355,6 +1493,8 @@ ReplayResult replay_trace(Observatory& observatory, const Trace& trace,
     Observation obs = record.observation;
     obs.id = ObservationId{};  // let the observatory mint ids for replayed input.
     obs.source = source;
+    // What is ingested here is a replay of a recording, not a live measurement.
+    obs.provenance.mechanism = ObservationMechanism::kReplayed;
     if (options.include_wall_times) {
       obs.timestamp.wall = WallTimestamp::now();
     }

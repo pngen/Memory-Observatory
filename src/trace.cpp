@@ -6,6 +6,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
+#include <limits>
 #include <map>
 #include <sstream>
 #include <string_view>
@@ -15,6 +17,15 @@ namespace memory_observatory {
 namespace {
 
 constexpr std::size_t kHeaderSize = 24;
+
+// Whether a decoded integer is one of an enum's values. Every enum a trace
+// carries counts up from zero, so its last enumerator bounds the range.
+template <typename E>
+bool enum_in_range(std::int64_t v, E last) {
+  return v >= 0 && v <= static_cast<std::int64_t>(last);
+}
+
+bool memory_kind_ok(std::int64_t v) { return enum_in_range(v, MemoryKind::kOther); }
 
 class BinaryWriter {
  public:
@@ -95,7 +106,10 @@ class BinaryReader {
   bool odou(std::optional<double>& out) {
     std::uint8_t p = 0; double v = 0;
     if (!u8(p) || !f64(v)) return false;
-    if (p) out = v;
+    if (p) {
+      if (!std::isfinite(v)) return false;  // a value that is present is finite
+      out = v;
+    }
     return true;
   }
   bool ou64(std::optional<Bytes>& out) {
@@ -255,13 +269,17 @@ Result<Trace> deserialize_trace_binary(const std::uint8_t* data, std::size_t siz
   { BinaryReader cr(data + size - 4, 4); (void)cr.u32(stored); }
   if (expect != stored) return fail<Trace>(ErrorCode::kCorruption, "trace checksum mismatch");
 
-  BinaryReader r(data, size);
+  // The body is everything before the checksum: the checksum's own bytes are
+  // never record data.
+  BinaryReader r(data, size - 4);
   std::uint32_t magic = 0, version = 0, endian = 0, reserved = 0;
   if (!r.u32(magic) || !r.u32(version) || !r.u32(endian) || !r.u32(reserved)) {
     return fail<Trace>(ErrorCode::kMalformedInput, "bad header");
   }
   if (magic != kTraceMagic) return fail<Trace>(ErrorCode::kInvalidTrace, "bad magic");
   if (version != kTraceFormatVersion) return fail<Trace>(ErrorCode::kUnsupportedVersion, "unsupported version");
+  // Every field is decoded little-endian, so that is the only flag accepted.
+  if (endian != 1) return fail<Trace>(ErrorCode::kIncompatibleVersion, "unsupported byte order");
   std::uint64_t count = 0;
   if (!r.u64(count) || count > limits.max_records) {
     return fail<Trace>(ErrorCode::kBoundExceeded, "record count bound");
@@ -301,6 +319,8 @@ Result<Trace> deserialize_trace_binary(const std::uint8_t* data, std::size_t siz
     if (!r.u64(gen) || !r.u64(ep)) {
       return fail<Trace>(ErrorCode::kMalformedInput, "bad generation/epoch");
     }
+    if (mono < 0) return fail<Trace>(ErrorCode::kInvalidTimestamp, "negative monotonic timestamp");
+    if (!enum_in_range(dk, DomainKind::kUserDefined)) return fail<Trace>(ErrorCode::kInvalidEnum, "bad domain_kind");
     o.id = ObservationId{id};
     o.source = SourceId{src};
     o.timestamp.monotonic = MonotonicTimestamp{mono};
@@ -325,6 +345,8 @@ Result<Trace> deserialize_trace_binary(const std::uint8_t* data, std::size_t siz
     std::uint8_t wt = 0, cp = 0;
     double conf = 0;
     if (!r.i64(mech) || !r.u8(wt) || !r.u8(cp) || !r.f64(conf)) return fail<Trace>(ErrorCode::kMalformedInput, "bad provenance");
+    if (!enum_in_range(mech, ObservationMechanism::kExternal)) return fail<Trace>(ErrorCode::kInvalidEnum, "bad mechanism");
+    if (cp && !(conf >= 0.0 && conf <= 1.0)) return fail<Trace>(ErrorCode::kMalformedInput, "bad confidence");
     o.provenance.mechanism = static_cast<ObservationMechanism>(mech);
     o.provenance.wall_clock_trusted = (wt != 0);
     if (cp) o.provenance.confidence = Confidence{conf};
@@ -341,16 +363,16 @@ Result<Trace> deserialize_trace_binary(const std::uint8_t* data, std::size_t siz
     switch (pi) {
       case 0: o.payload = std::monostate{}; break;
       case 1: { std::uint8_t mt = 0; if (!r.u8(mt)) return fail<Trace>(ErrorCode::kMalformedInput, "bad metric tag");
-        if (mt == 0) { GaugeSample g; std::int64_t kind=0; if(!r.i64(kind)) return fail<Trace>(ErrorCode::kMalformedInput,"bad gauge kind"); g.kind=static_cast<MemoryKind>(kind); if(!r.odou(g.value)) return fail<Trace>(ErrorCode::kMalformedInput,"bad gauge value"); o.payload=g; }
-        else if (mt == 1) { CounterSample c; std::int64_t kind=0; std::uint8_t rp=0,res=0; std::uint64_t v=0; if(!r.i64(kind)||!r.u8(rp)||!r.u64(v)||!r.u8(res)) return fail<Trace>(ErrorCode::kMalformedInput,"bad counter"); c.kind=static_cast<MemoryKind>(kind); if(rp)c.value=v; c.reset=(res!=0); o.payload=c; }
-        else if (mt == 2) { DistributionSample d; std::int64_t kind=0; std::uint8_t cp2=0; std::uint64_t cnt=0; if(!r.i64(kind)||!r.u8(cp2)||!r.u64(cnt)) return fail<Trace>(ErrorCode::kMalformedInput,"bad dist"); d.kind=static_cast<MemoryKind>(kind); if(cp2)d.summary.count=cnt; if(!r.odou(d.summary.mean)||!r.odou(d.summary.min)||!r.odou(d.summary.max)||!r.odou(d.summary.p50)||!r.odou(d.summary.p90)||!r.odou(d.summary.p95)||!r.odou(d.summary.p99)) return fail<Trace>(ErrorCode::kMalformedInput,"bad dist fields"); o.payload=d; }
+        if (mt == 0) { GaugeSample g; std::int64_t kind=0; if(!r.i64(kind)) return fail<Trace>(ErrorCode::kMalformedInput,"bad gauge kind"); if(!memory_kind_ok(kind)) return fail<Trace>(ErrorCode::kInvalidEnum,"bad gauge kind"); g.kind=static_cast<MemoryKind>(kind); if(!r.odou(g.value)) return fail<Trace>(ErrorCode::kMalformedInput,"bad gauge value"); o.payload=g; }
+        else if (mt == 1) { CounterSample c; std::int64_t kind=0; std::uint8_t rp=0,res=0; std::uint64_t v=0; if(!r.i64(kind)||!r.u8(rp)||!r.u64(v)||!r.u8(res)) return fail<Trace>(ErrorCode::kMalformedInput,"bad counter"); if(!memory_kind_ok(kind)) return fail<Trace>(ErrorCode::kInvalidEnum,"bad counter kind"); c.kind=static_cast<MemoryKind>(kind); if(rp)c.value=v; c.reset=(res!=0); o.payload=c; }
+        else if (mt == 2) { DistributionSample d; std::int64_t kind=0; std::uint8_t cp2=0; std::uint64_t cnt=0; if(!r.i64(kind)||!r.u8(cp2)||!r.u64(cnt)) return fail<Trace>(ErrorCode::kMalformedInput,"bad dist"); if(!memory_kind_ok(kind)) return fail<Trace>(ErrorCode::kInvalidEnum,"bad dist kind"); d.kind=static_cast<MemoryKind>(kind); if(cp2)d.summary.count=cnt; if(!r.odou(d.summary.mean)||!r.odou(d.summary.min)||!r.odou(d.summary.max)||!r.odou(d.summary.p50)||!r.odou(d.summary.p90)||!r.odou(d.summary.p95)||!r.odou(d.summary.p99)) return fail<Trace>(ErrorCode::kMalformedInput,"bad dist fields"); o.payload=d; }
         else return fail<Trace>(ErrorCode::kInvalidEnum, "bad metric sub-tag"); break; }
-      case 2: { Event e; std::int64_t et=0,es=0,esr=0; std::uint8_t m=0; if(!r.i64(et)||!r.i64(es)||!r.i64(esr)||!r.u8(m)) return fail<Trace>(ErrorCode::kMalformedInput,"bad event"); e.type=static_cast<EventType>(et); e.severity=static_cast<EventSeverity>(es); e.source=static_cast<EventSource>(esr); if(m){ std::string msg; if(!r.blob(msg, limits.max_string_bytes)) return fail<Trace>(ErrorCode::kMalformedInput,"bad event msg"); e.message=std::move(msg); } o.payload=e; break; }
+      case 2: { Event e; std::int64_t et=0,es=0,esr=0; std::uint8_t m=0; if(!r.i64(et)||!r.i64(es)||!r.i64(esr)||!r.u8(m)) return fail<Trace>(ErrorCode::kMalformedInput,"bad event"); if(!enum_in_range(et, EventType::kOther)||!enum_in_range(es, EventSeverity::kCritical)||!enum_in_range(esr, EventSource::kSystem)) return fail<Trace>(ErrorCode::kInvalidEnum,"bad event enum"); e.type=static_cast<EventType>(et); e.severity=static_cast<EventSeverity>(es); e.source=static_cast<EventSource>(esr); if(m){ std::string msg; if(!r.blob(msg, limits.max_string_bytes)) return fail<Trace>(ErrorCode::kMalformedInput,"bad event msg"); e.message=std::move(msg); } o.payload=e; break; }
       case 3: { DomainState ds; std::uint64_t ddom=0; if(!r.u64(ddom)) return fail<Trace>(ErrorCode::kMalformedInput,"bad domain state"); ds.domain=DomainId{ddom}; DomainCapacity cap; if(!r.ou64(cap.physical)||!r.ou64(cap.governed)||!r.ou64(cap.committed)||!r.ou64(cap.reserved)||!r.ou64(cap.allocated)||!r.ou64(cap.live)||!r.ou64(cap.available)||!r.ou64(cap.cached)||!r.ou64(cap.pinned)||!r.ou64(cap.mapped)) return fail<Trace>(ErrorCode::kMalformedInput,"bad domain capacity"); ds.capacity=cap; o.payload=ds; break; }
-      case 4: { ObjectState os; std::int64_t kind=0; if(!r.i64(kind)) return fail<Trace>(ErrorCode::kMalformedInput,"bad object"); os.kind=static_cast<MemoryKind>(kind); if(!r.ou64(os.size)||!r.ou64(os.resident)) return fail<Trace>(ErrorCode::kMalformedInput,"bad object fields"); o.payload=os; break; }
+      case 4: { ObjectState os; std::int64_t kind=0; if(!r.i64(kind)) return fail<Trace>(ErrorCode::kMalformedInput,"bad object"); if(!memory_kind_ok(kind)) return fail<Trace>(ErrorCode::kInvalidEnum,"bad object kind"); os.kind=static_cast<MemoryKind>(kind); if(!r.ou64(os.size)||!r.ou64(os.resident)) return fail<Trace>(ErrorCode::kMalformedInput,"bad object fields"); o.payload=os; break; }
       case 5: { ResidencyState rs; if(!r.ou64(rs.resident)||!r.ou64(rs.total)) return fail<Trace>(ErrorCode::kMalformedInput,"bad residency"); o.payload=rs; break; }
       case 6: { PressureState ps; if(!r.odou(ps.level)||!r.ou64(ps.available)) return fail<Trace>(ErrorCode::kMalformedInput,"bad pressure"); o.payload=ps; break; }
-      case 7: { TransferState ts; if(!r.ou64(ts.moved)) return fail<Trace>(ErrorCode::kMalformedInput,"bad transfer"); std::uint8_t dp=0; std::int64_t dn=0; if(!r.u8(dp)||!r.i64(dn)) return fail<Trace>(ErrorCode::kMalformedInput,"bad transfer dur"); if(dp) ts.duration=Duration{dn}; o.payload=ts; break; }
+      case 7: { TransferState ts; if(!r.ou64(ts.moved)) return fail<Trace>(ErrorCode::kMalformedInput,"bad transfer"); std::uint8_t dp=0; std::int64_t dn=0; if(!r.u8(dp)||!r.i64(dn)) return fail<Trace>(ErrorCode::kMalformedInput,"bad transfer dur"); if(dp && dn < 0) return fail<Trace>(ErrorCode::kInvalidTimestamp,"negative transfer duration"); if(dp) ts.duration=Duration{dn}; o.payload=ts; break; }
       case 8: { AllocationState as; if(!r.ou64(as.allocated)||!r.ou64(as.freed)||!r.ou64(as.alloc_count)||!r.ou64(as.free_count)) return fail<Trace>(ErrorCode::kMalformedInput,"bad alloc"); o.payload=as; break; }
       case 9: { ReclaimState rc; if(!r.ou64(rc.reclaimed)||!r.ou64(rc.event_count)) return fail<Trace>(ErrorCode::kMalformedInput,"bad reclaim"); o.payload=rc; break; }
       case 10: { CacheState cs; if(!r.ou64(cs.resident)||!r.ou64(cs.evicted)||!r.ou64(cs.evict_count)) return fail<Trace>(ErrorCode::kMalformedInput,"bad cache"); o.payload=cs; break; }
@@ -364,6 +386,9 @@ Result<Trace> deserialize_trace_binary(const std::uint8_t* data, std::size_t siz
       o.annotations.push_back(std::move(a));
     }
     trace.records.push_back(std::move(rec));
+  }
+  if (!r.empty()) {
+    return fail<Trace>(ErrorCode::kMalformedInput, "trailing data after the last record");
   }
   return ok(std::move(trace));
 }
@@ -381,6 +406,12 @@ struct JsonNode {
   K kind = K::Null;
   bool b = false;
   double num = 0.0;
+  // A number written without a fraction or an exponent is also kept exactly, as
+  // a sign and a magnitude: 64-bit ids, timestamps and byte counts stop fitting
+  // a double once they pass 2^53.
+  bool integral = false;
+  bool negative = false;
+  std::uint64_t magnitude = 0;
   std::string str;
   std::vector<JsonNode> arr;
   std::vector<std::pair<std::string, JsonNode>> obj;
@@ -424,7 +455,14 @@ void emit(const JsonNode& n, std::ostringstream& os) {
   switch (n.kind) {
     case JsonNode::K::Null: os << "null"; break;
     case JsonNode::K::Bool: os << (n.b ? "true" : "false"); break;
-    case JsonNode::K::Num: os << json_num(n.num); break;
+    case JsonNode::K::Num:
+      if (n.integral) {
+        if (n.negative && n.magnitude != 0) os << "-";
+        os << n.magnitude;
+      } else {
+        os << json_num(n.num);
+      }
+      break;
     case JsonNode::K::Str:
       os << "\"" << json_esc(n.str) << "\"";
       break;
@@ -471,6 +509,10 @@ class JsonParser {
   }
 
  private:
+  // The parser recurses once per nesting level, so the nesting it accepts is
+  // bounded. A trace nests five levels deep.
+  static constexpr std::size_t kMaxDepth = 64;
+
   void skip_ws() {
     while (pos_ < s_.size()) {
       const char c = s_[pos_];
@@ -481,8 +523,15 @@ class JsonParser {
   Result<JsonNode> parse_value(JsonNode& out) {
     if (pos_ >= s_.size()) return fail<JsonNode>(ErrorCode::kMalformedInput, "eof in value");
     const char c = s_[pos_];
-    if (c == '{') return parse_obj(out);
-    if (c == '[') return parse_arr(out);
+    if (c == '{' || c == '[') {
+      if (depth_ >= kMaxDepth) {
+        return fail<JsonNode>(ErrorCode::kBoundExceeded, "JSON nesting too deep");
+      }
+      ++depth_;
+      auto r = (c == '{') ? parse_obj(out) : parse_arr(out);
+      --depth_;
+      return r;
+    }
     if (c == '\"') return parse_str(out);
     if (c == 't') return parse_lit("true", true, out);
     if (c == 'f') return parse_lit("false", false, out);
@@ -502,6 +551,7 @@ class JsonParser {
   }
   Result<JsonNode> parse_num(JsonNode& out) {
     const std::size_t start = pos_;
+    bool whole = true;
     if (pos_ < s_.size() && s_[pos_] == '-') ++pos_;
     if (pos_ < s_.size() && s_[pos_] == '0') { ++pos_; }
     else {
@@ -511,6 +561,7 @@ class JsonParser {
       while (pos_ < s_.size() && (s_[pos_] >= '0' && s_[pos_] <= '9')) ++pos_;
     }
     if (pos_ < s_.size() && s_[pos_] == '.') {
+      whole = false;
       ++pos_;
       if (pos_ >= s_.size() || s_[pos_] < '0' || s_[pos_] > '9') {
         return fail<JsonNode>(ErrorCode::kMalformedInput, "bad fraction");
@@ -518,6 +569,7 @@ class JsonParser {
       while (pos_ < s_.size() && (s_[pos_] >= '0' && s_[pos_] <= '9')) ++pos_;
     }
     if (pos_ < s_.size() && (s_[pos_] == 'e' || s_[pos_] == 'E')) {
+      whole = false;
       ++pos_;
       if (pos_ < s_.size() && (s_[pos_] == '+' || s_[pos_] == '-')) ++pos_;
       if (pos_ >= s_.size() || s_[pos_] < '0' || s_[pos_] > '9') {
@@ -532,7 +584,39 @@ class JsonParser {
     } catch (...) {
       return fail<JsonNode>(ErrorCode::kMalformedInput, "number overflow");
     }
+    if (whole) {
+      // Keep the exact value of a whole number that fits 64 bits.
+      const bool neg = text[0] == '-';
+      std::uint64_t magnitude = 0;
+      bool fits = true;
+      for (std::size_t i = neg ? 1 : 0; i < text.size(); ++i) {
+        const std::uint64_t digit = static_cast<std::uint64_t>(text[i] - '0');
+        if (magnitude > (std::numeric_limits<std::uint64_t>::max() - digit) / 10) {
+          fits = false;
+          break;
+        }
+        magnitude = magnitude * 10 + digit;
+      }
+      if (fits) {
+        out.integral = true;
+        out.negative = neg;
+        out.magnitude = magnitude;
+      }
+    }
     return ok(JsonNode{});
+  }
+  bool hex4(unsigned& code) {
+    if (pos_ + 4 > s_.size()) return false;
+    code = 0;
+    for (int i = 0; i < 4; ++i) {
+      const char h = s_[pos_++];
+      code <<= 4;
+      if (h >= '0' && h <= '9') code |= static_cast<unsigned>(h - '0');
+      else if (h >= 'a' && h <= 'f') code |= static_cast<unsigned>(h - 'a' + 10);
+      else if (h >= 'A' && h <= 'F') code |= static_cast<unsigned>(h - 'A' + 10);
+      else return false;
+    }
+    return true;
   }
   Result<JsonNode> parse_str(JsonNode& out) {
     if (pos_ >= s_.size() || s_[pos_] != '\"') {
@@ -543,6 +627,9 @@ class JsonParser {
     while (pos_ < s_.size()) {
       const char c = s_[pos_++];
       if (c == '\"') { out.kind = JsonNode::K::Str; out.str = std::move(val); return ok(JsonNode{}); }
+      if (static_cast<unsigned char>(c) < 0x20) {
+        return fail<JsonNode>(ErrorCode::kMalformedInput, "control character in string");
+      }
       if (c == '\\') {
         if (pos_ >= s_.size()) return fail<JsonNode>(ErrorCode::kMalformedInput, "bad escape");
         const char e = s_[pos_++];
@@ -556,22 +643,34 @@ class JsonParser {
           case 'b': val += '\b'; break;
           case 'f': val += '\f'; break;
           case 'u': {
-            if (pos_ + 4 > s_.size()) return fail<JsonNode>(ErrorCode::kMalformedInput, "bad unicode");
             unsigned code = 0;
-            for (int i = 0; i < 4; ++i) {
-              const char h = s_[pos_++];
-              code <<= 4;
-              if (h >= '0' && h <= '9') code |= static_cast<unsigned>(h - '0');
-              else if (h >= 'a' && h <= 'f') code |= static_cast<unsigned>(h - 'a' + 10);
-              else if (h >= 'A' && h <= 'F') code |= static_cast<unsigned>(h - 'A' + 10);
-              else return fail<JsonNode>(ErrorCode::kMalformedInput, "bad unicode hex");
+            if (!hex4(code)) return fail<JsonNode>(ErrorCode::kMalformedInput, "bad unicode");
+            if (code >= 0xD800 && code <= 0xDBFF) {
+              // A high surrogate is only half of a character: the low half
+              // has to follow as its own escape.
+              unsigned low = 0;
+              if (pos_ + 2 > s_.size() || s_[pos_] != '\\' || s_[pos_ + 1] != 'u') {
+                return fail<JsonNode>(ErrorCode::kMalformedInput, "unpaired surrogate");
+              }
+              pos_ += 2;
+              if (!hex4(low) || low < 0xDC00 || low > 0xDFFF) {
+                return fail<JsonNode>(ErrorCode::kMalformedInput, "unpaired surrogate");
+              }
+              code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
+            } else if (code >= 0xDC00 && code <= 0xDFFF) {
+              return fail<JsonNode>(ErrorCode::kMalformedInput, "unpaired surrogate");
             }
             if (code < 0x80) val += static_cast<char>(code);
             else if (code < 0x800) {
               val += static_cast<char>(0xC0 | (code >> 6));
               val += static_cast<char>(0x80 | (code & 0x3F));
-            } else {
+            } else if (code < 0x10000) {
               val += static_cast<char>(0xE0 | (code >> 12));
+              val += static_cast<char>(0x80 | ((code >> 6) & 0x3F));
+              val += static_cast<char>(0x80 | (code & 0x3F));
+            } else {
+              val += static_cast<char>(0xF0 | (code >> 18));
+              val += static_cast<char>(0x80 | ((code >> 12) & 0x3F));
               val += static_cast<char>(0x80 | ((code >> 6) & 0x3F));
               val += static_cast<char>(0x80 | (code & 0x3F));
             }
@@ -629,11 +728,8 @@ class JsonParser {
   }
   std::string_view s_;
   std::size_t pos_ = 0;
+  std::size_t depth_ = 0;
 };
-
-std::string json_string(const std::string& s) {
-  return "\"" + json_esc(s) + "\"";
-}
 
 }  // namespace
 
@@ -649,8 +745,21 @@ JsonNode j_num(double v) { JsonNode n; n.kind = JsonNode::K::Num; n.num = v; ret
 JsonNode j_str(std::string s) { JsonNode n; n.kind = JsonNode::K::Str; n.str = std::move(s); return n; }
 JsonNode j_bool(bool b) { JsonNode n; n.kind = JsonNode::K::Bool; n.b = b; return n; }
 JsonNode j_null() { return JsonNode{}; }
-JsonNode j_int(std::int64_t v) { return j_num(static_cast<double>(v)); }
-JsonNode j_uint(std::uint64_t v) { return j_num(static_cast<double>(v)); }
+JsonNode j_uint(std::uint64_t v) {
+  JsonNode n = j_num(static_cast<double>(v));
+  n.integral = true;
+  n.magnitude = v;
+  return n;
+}
+JsonNode j_int(std::int64_t v) {
+  // The magnitude is taken in unsigned arithmetic so the most negative value
+  // has one.
+  JsonNode n = j_uint(v < 0 ? std::uint64_t{0} - static_cast<std::uint64_t>(v)
+                            : static_cast<std::uint64_t>(v));
+  n.negative = v < 0;
+  n.num = static_cast<double>(v);
+  return n;
+}
 
 // Split a domain/kind to its string name.
 std::string payload_type_name(std::size_t idx) {
@@ -683,7 +792,7 @@ JsonNode build_payload(const Observation& o) {
     } else if (const auto* c = std::get_if<CounterSample>(ms)) {
       node.obj.emplace_back("mtype", j_str("counter"));
       node.obj.emplace_back("kind", j_str(to_string(c->kind)));
-      node.obj.emplace_back("value", c->value ? j_num(static_cast<double>(*c->value)) : j_null());
+      node.obj.emplace_back("value", c->value ? j_uint(*c->value) : j_null());
       node.obj.emplace_back("reset", j_bool(c->reset));
     } else if (const auto* d = std::get_if<DistributionSample>(ms)) {
       node.obj.emplace_back("mtype", j_str("distribution"));
@@ -692,7 +801,7 @@ JsonNode build_payload(const Observation& o) {
       node.obj.emplace_back("mean", s.mean ? j_num(*s.mean) : j_null());
       node.obj.emplace_back("p95", s.p95 ? j_num(*s.p95) : j_null());
       node.obj.emplace_back("p99", s.p99 ? j_num(*s.p99) : j_null());
-      node.obj.emplace_back("count", s.count ? j_num(static_cast<double>(*s.count)) : j_null());
+      node.obj.emplace_back("count", s.count ? j_uint(*s.count) : j_null());
     }
   } else if (const auto* e = std::get_if<Event>(&o.payload)) {
     node.obj.emplace_back("etype", j_str(to_string(e->type)));
@@ -703,7 +812,7 @@ JsonNode build_payload(const Observation& o) {
     node.obj.emplace_back("domain", j_uint(ds->domain.value()));
     const DomainCapacity& cap = ds->capacity;
     auto addcap = [&](const char* k, std::optional<Bytes> v) {
-      node.obj.emplace_back(k, v ? j_num(static_cast<double>(*v)) : j_null());
+      node.obj.emplace_back(k, v ? j_uint(*v) : j_null());
     };
     addcap("physical", cap.physical); addcap("governed", cap.governed);
     addcap("committed", cap.committed); addcap("reserved", cap.reserved);
@@ -712,7 +821,7 @@ JsonNode build_payload(const Observation& o) {
     addcap("pinned", cap.pinned); addcap("mapped", cap.mapped);
   } else if (const auto* ps = std::get_if<PressureState>(&o.payload)) {
     node.obj.emplace_back("level", ps->level ? j_num(*ps->level) : j_null());
-    node.obj.emplace_back("available", ps->available ? j_num(static_cast<double>(*ps->available)) : j_null());
+    node.obj.emplace_back("available", ps->available ? j_uint(*ps->available) : j_null());
   }
   return node;
 }
@@ -740,6 +849,299 @@ JsonNode build_record_obs(const Observation& o) {
   }
   rec.obj.emplace_back("annotations", std::move(ann));
   return rec;
+}
+
+// ---- strict reading --------------------------------------------------------
+//
+// A member that is absent, or null, is "not given" and leaves its default. A
+// member that is given has to have the type the schema names for it: nothing
+// malformed is skipped or silently defaulted.
+
+const JsonNode* given(const JsonNode& obj, std::string_view key) {
+  for (const auto& kv : obj.obj) {
+    if (kv.first == key) {
+      return kv.second.kind == JsonNode::K::Null ? nullptr : &kv.second;
+    }
+  }
+  return nullptr;
+}
+
+// Exact integer values of a JSON number. A number that is not whole, or is
+// outside the target range, is not an integer of that type.
+bool json_u64(const JsonNode& n, std::uint64_t& out) {
+  if (n.kind != JsonNode::K::Num) return false;
+  if (n.integral) {
+    if (n.negative && n.magnitude != 0) return false;
+    out = n.magnitude;
+    return true;
+  }
+  const double v = n.num;
+  if (!(v >= 0.0) || v >= 18446744073709551616.0 || v != std::floor(v)) return false;
+  out = static_cast<std::uint64_t>(v);
+  return true;
+}
+
+bool json_i64(const JsonNode& n, std::int64_t& out) {
+  if (n.kind != JsonNode::K::Num) return false;
+  constexpr std::uint64_t kLowestMagnitude = 9223372036854775808ull;
+  if (n.integral) {
+    if (n.negative) {
+      if (n.magnitude > kLowestMagnitude) return false;
+      out = n.magnitude == kLowestMagnitude
+                ? std::numeric_limits<std::int64_t>::min()
+                : -static_cast<std::int64_t>(n.magnitude);
+    } else {
+      if (n.magnitude >= kLowestMagnitude) return false;
+      out = static_cast<std::int64_t>(n.magnitude);
+    }
+    return true;
+  }
+  const double v = n.num;
+  if (!(v >= -9223372036854775808.0) || v >= 9223372036854775808.0 ||
+      v != std::floor(v)) {
+    return false;
+  }
+  out = static_cast<std::int64_t>(v);
+  return true;
+}
+
+ErrorCode first_of(std::initializer_list<ErrorCode> codes) {
+  for (const ErrorCode code : codes) {
+    if (code != ErrorCode::kNone) return code;
+  }
+  return ErrorCode::kNone;
+}
+
+ErrorCode read_string(const JsonNode& obj, std::string_view key,
+                      std::size_t max_bytes, std::string& out,
+                      bool* present = nullptr) {
+  const JsonNode* v = given(obj, key);
+  if (present) *present = v != nullptr;
+  if (!v) return ErrorCode::kNone;
+  if (v->kind != JsonNode::K::Str) return ErrorCode::kMalformedInput;
+  if (v->str.size() > max_bytes) return ErrorCode::kBoundExceeded;
+  out = v->str;
+  return ErrorCode::kNone;
+}
+
+ErrorCode read_u64(const JsonNode& obj, std::string_view key, std::uint64_t& out,
+                   bool* present = nullptr) {
+  const JsonNode* v = given(obj, key);
+  if (present) *present = v != nullptr;
+  if (!v) return ErrorCode::kNone;
+  return json_u64(*v, out) ? ErrorCode::kNone : ErrorCode::kMalformedInput;
+}
+
+ErrorCode read_i64(const JsonNode& obj, std::string_view key, std::int64_t& out,
+                   bool* present = nullptr) {
+  const JsonNode* v = given(obj, key);
+  if (present) *present = v != nullptr;
+  if (!v) return ErrorCode::kNone;
+  return json_i64(*v, out) ? ErrorCode::kNone : ErrorCode::kMalformedInput;
+}
+
+ErrorCode read_optional_u64(const JsonNode& obj, std::string_view key,
+                            std::optional<std::uint64_t>& out) {
+  std::uint64_t value = 0;
+  bool present = false;
+  const ErrorCode code = read_u64(obj, key, value, &present);
+  if (code == ErrorCode::kNone && present) out = value;
+  return code;
+}
+
+ErrorCode read_optional_double(const JsonNode& obj, std::string_view key,
+                               std::optional<double>& out) {
+  const JsonNode* v = given(obj, key);
+  if (!v) return ErrorCode::kNone;
+  if (v->kind != JsonNode::K::Num) return ErrorCode::kMalformedInput;
+  out = v->num;
+  return ErrorCode::kNone;
+}
+
+ErrorCode read_bool(const JsonNode& obj, std::string_view key, bool& out) {
+  const JsonNode* v = given(obj, key);
+  if (!v) return ErrorCode::kNone;
+  if (v->kind != JsonNode::K::Bool) return ErrorCode::kMalformedInput;
+  out = v->b;
+  return ErrorCode::kNone;
+}
+
+// An enum is written as the name its to_string() gives, so that name is what
+// is read back. A name no enumerator has is an invalid enum.
+template <typename E>
+ErrorCode read_enum(const JsonNode& obj, std::string_view key, E last, E& out) {
+  const JsonNode* v = given(obj, key);
+  if (!v) return ErrorCode::kNone;
+  if (v->kind != JsonNode::K::Str) return ErrorCode::kMalformedInput;
+  for (std::int32_t i = 0; i <= static_cast<std::int32_t>(last); ++i) {
+    const E candidate = static_cast<E>(i);
+    if (v->str == to_string(candidate)) {
+      out = candidate;
+      return ErrorCode::kNone;
+    }
+  }
+  return ErrorCode::kInvalidEnum;
+}
+
+ErrorCode read_annotations(const JsonNode& obj, const TraceLimits& limits,
+                           std::vector<Annotation>& out) {
+  const JsonNode* v = given(obj, "annotations");
+  if (!v) return ErrorCode::kNone;
+  if (v->kind != JsonNode::K::Arr) return ErrorCode::kMalformedInput;
+  if (v->arr.size() > limits.max_annotation_count) return ErrorCode::kBoundExceeded;
+  for (const auto& a : v->arr) {
+    if (a.kind != JsonNode::K::Obj) return ErrorCode::kMalformedInput;
+    Annotation x;
+    const ErrorCode code = first_of(
+        {read_string(a, "k", limits.max_annotation_bytes, x.key),
+         read_string(a, "v", limits.max_annotation_bytes, x.value)});
+    if (code != ErrorCode::kNone) return code;
+    out.push_back(std::move(x));
+  }
+  return ErrorCode::kNone;
+}
+
+// Reads back what build_payload() writes. The state payloads the writer gives
+// no fields for keep their type, with every field unknown.
+ErrorCode read_payload(const JsonNode& p, const TraceLimits& limits,
+                       ObservationPayload& out) {
+  if (p.kind != JsonNode::K::Obj) return ErrorCode::kMalformedInput;
+  std::string type = "none";
+  ErrorCode code = read_string(p, "type", limits.max_string_bytes, type);
+  if (code != ErrorCode::kNone) return code;
+
+  if (type == "none") {
+    out = std::monostate{};
+    return ErrorCode::kNone;
+  }
+  if (type == "metric") {
+    std::string mtype;
+    MemoryKind kind = MemoryKind::kUnknown;
+    code = first_of({read_string(p, "mtype", limits.max_string_bytes, mtype),
+                     read_enum(p, "kind", MemoryKind::kOther, kind)});
+    if (code != ErrorCode::kNone) return code;
+    if (mtype == "gauge") {
+      GaugeSample g{};
+      g.kind = kind;
+      code = read_optional_double(p, "value", g.value);
+      if (code != ErrorCode::kNone) return code;
+      out = MetricSample{g};
+      return ErrorCode::kNone;
+    }
+    if (mtype == "counter") {
+      CounterSample c{};
+      c.kind = kind;
+      code = first_of({read_optional_u64(p, "value", c.value),
+                       read_bool(p, "reset", c.reset)});
+      if (code != ErrorCode::kNone) return code;
+      out = MetricSample{c};
+      return ErrorCode::kNone;
+    }
+    if (mtype == "distribution") {
+      DistributionSample d{};
+      d.kind = kind;
+      DistributionSummary& s = d.summary;
+      code = first_of({read_optional_double(p, "mean", s.mean),
+                       read_optional_double(p, "min", s.min),
+                       read_optional_double(p, "max", s.max),
+                       read_optional_double(p, "p50", s.p50),
+                       read_optional_double(p, "p90", s.p90),
+                       read_optional_double(p, "p95", s.p95),
+                       read_optional_double(p, "p99", s.p99),
+                       read_optional_u64(p, "count", s.count)});
+      if (code != ErrorCode::kNone) return code;
+      out = MetricSample{d};
+      return ErrorCode::kNone;
+    }
+    return ErrorCode::kInvalidEnum;
+  }
+  if (type == "event") {
+    Event ev;
+    std::string message;
+    bool has_message = false;
+    code = first_of(
+        {read_enum(p, "etype", EventType::kOther, ev.type),
+         read_enum(p, "severity", EventSeverity::kCritical, ev.severity),
+         read_enum(p, "esource", EventSource::kSystem, ev.source),
+         read_string(p, "message", limits.max_string_bytes, message, &has_message)});
+    if (code != ErrorCode::kNone) return code;
+    if (has_message) ev.message = std::move(message);
+    out = std::move(ev);
+    return ErrorCode::kNone;
+  }
+  if (type == "domain_state") {
+    DomainState ds;
+    std::uint64_t domain = 0;
+    DomainCapacity& cap = ds.capacity;
+    code = first_of({read_u64(p, "domain", domain),
+                     read_optional_u64(p, "physical", cap.physical),
+                     read_optional_u64(p, "governed", cap.governed),
+                     read_optional_u64(p, "committed", cap.committed),
+                     read_optional_u64(p, "reserved", cap.reserved),
+                     read_optional_u64(p, "allocated", cap.allocated),
+                     read_optional_u64(p, "live", cap.live),
+                     read_optional_u64(p, "available", cap.available),
+                     read_optional_u64(p, "cached", cap.cached),
+                     read_optional_u64(p, "pinned", cap.pinned),
+                     read_optional_u64(p, "mapped", cap.mapped)});
+    if (code != ErrorCode::kNone) return code;
+    ds.domain = DomainId{domain};
+    out = ds;
+    return ErrorCode::kNone;
+  }
+  if (type == "pressure_state") {
+    PressureState ps;
+    code = first_of({read_optional_double(p, "level", ps.level),
+                     read_optional_u64(p, "available", ps.available)});
+    if (code != ErrorCode::kNone) return code;
+    out = ps;
+    return ErrorCode::kNone;
+  }
+  if (type == "object_state") { out = ObjectState{}; return ErrorCode::kNone; }
+  if (type == "residency_state") { out = ResidencyState{}; return ErrorCode::kNone; }
+  if (type == "transfer_state") { out = TransferState{}; return ErrorCode::kNone; }
+  if (type == "allocation_state") { out = AllocationState{}; return ErrorCode::kNone; }
+  if (type == "reclaim_state") { out = ReclaimState{}; return ErrorCode::kNone; }
+  if (type == "cache_state") { out = CacheState{}; return ErrorCode::kNone; }
+  if (type == "system_state") { out = SystemState{}; return ErrorCode::kNone; }
+  return ErrorCode::kInvalidEnum;
+}
+
+ErrorCode read_record(const JsonNode& node, const TraceLimits& limits,
+                      Observation& o) {
+  if (node.kind != JsonNode::K::Obj) return ErrorCode::kMalformedInput;
+  std::uint64_t id = 0, source = 0, domain = 0, generation = 0, epoch = 0;
+  std::int64_t mono = 0, wall = 0, seq = 0;
+  bool has_wall = false;
+  std::optional<double> confidence;
+  ErrorCode code = first_of(
+      {read_u64(node, "id", id), read_u64(node, "source", source),
+       read_i64(node, "mono", mono), read_i64(node, "wall", wall, &has_wall),
+       read_i64(node, "seq", seq), read_u64(node, "domain", domain),
+       read_enum(node, "domain_kind", DomainKind::kUserDefined, o.domain_kind),
+       read_u64(node, "generation", generation), read_u64(node, "epoch", epoch),
+       read_enum(node, "mech", ObservationMechanism::kExternal,
+                 o.provenance.mechanism),
+       read_optional_double(node, "confidence", confidence),
+       read_annotations(node, limits, o.annotations)});
+  if (code != ErrorCode::kNone) return code;
+  if (mono < 0) return ErrorCode::kInvalidTimestamp;
+  if (confidence && !(*confidence >= 0.0 && *confidence <= 1.0)) {
+    return ErrorCode::kMalformedInput;
+  }
+  o.id = ObservationId{id};
+  o.source = SourceId{source};
+  o.timestamp.monotonic = MonotonicTimestamp{mono};
+  if (has_wall) o.timestamp.wall = WallTimestamp{wall};
+  o.timestamp.sequence = SequenceNo{seq};
+  o.domain = DomainId{domain};
+  o.generation = Generation{generation};
+  o.epoch = Epoch{epoch};
+  if (confidence) o.provenance.confidence = Confidence{*confidence};
+  if (const JsonNode* p = given(node, "payload")) {
+    code = read_payload(*p, limits, o.payload);
+  }
+  return code;
 }
 
 }  // namespace
@@ -783,114 +1185,52 @@ Result<Trace> deserialize_trace_json(std::string_view text, const TraceLimits& l
   if (root.kind != JsonNode::K::Obj) {
     return fail<Trace>(ErrorCode::kMalformedInput, "trace root must be an object");
   }
-  auto get = [&](const char* k) -> const JsonNode* {
-    for (const auto& kv : root.obj) {
-      if (kv.first == k) return &kv.second;
-    }
-    return nullptr;
-  };
+
+  // The version names the schema everything else is read by, so it is required.
+  std::uint64_t version = 0;
+  bool has_version = false;
+  if (read_u64(root, "version", version, &has_version) != ErrorCode::kNone ||
+      !has_version) {
+    return fail<Trace>(ErrorCode::kMalformedInput,
+                       "trace version missing or not an integer");
+  }
+  if (version != kTraceFormatVersion) {
+    return fail<Trace>(ErrorCode::kUnsupportedVersion, "unsupported version");
+  }
+
   Trace trace;
-  if (const JsonNode* v = get("magic")) {
-    if (v->kind == JsonNode::K::Str) trace.format = v->str;
+  trace.version = kTraceFormatVersion;
+  std::uint64_t session = 0, id = 0;
+  const std::size_t max_string = limits.max_string_bytes;
+  const ErrorCode header = first_of(
+      {read_string(root, "magic", max_string, trace.format),
+       read_u64(root, "session", session), read_u64(root, "id", id),
+       read_string(root, "capture_machine", max_string, trace.capture_machine),
+       read_string(root, "capture_toolchain", max_string, trace.capture_toolchain),
+       read_string(root, "capture_os", max_string, trace.capture_os),
+       read_string(root, "capture_arch", max_string, trace.capture_arch),
+       read_string(root, "capture_mechanism", max_string, trace.capture_mechanism),
+       read_annotations(root, limits, trace.annotations)});
+  if (header != ErrorCode::kNone) {
+    return fail<Trace>(header, "bad trace header field");
   }
-  if (const JsonNode* v = get("version")) {
-    if (v->kind == JsonNode::K::Num) trace.version = static_cast<std::uint32_t>(v->num);
-    if (trace.version != kTraceFormatVersion) {
-      return fail<Trace>(ErrorCode::kUnsupportedVersion, "unsupported version");
-    }
-  }
-  if (const JsonNode* v = get("session")) {
-    if (v->kind == JsonNode::K::Num) trace.session = SessionId{static_cast<std::uint64_t>(v->num)};
-  }
-  if (const JsonNode* v = get("id")) {
-    if (v->kind == JsonNode::K::Num) trace.id = TraceId{static_cast<std::uint64_t>(v->num)};
-  }
-  if (const JsonNode* v = get("capture_machine")) if (v->kind == JsonNode::K::Str) trace.capture_machine = v->str;
-  if (const JsonNode* v = get("capture_toolchain")) if (v->kind == JsonNode::K::Str) trace.capture_toolchain = v->str;
-  if (const JsonNode* v = get("capture_os")) if (v->kind == JsonNode::K::Str) trace.capture_os = v->str;
-  if (const JsonNode* v = get("capture_arch")) if (v->kind == JsonNode::K::Str) trace.capture_arch = v->str;
-  if (const JsonNode* v = get("capture_mechanism")) if (v->kind == JsonNode::K::Str) trace.capture_mechanism = v->str;
+  trace.session = SessionId{session};
+  trace.id = TraceId{id};
 
-  if (const JsonNode* v = get("annotations")) {
-    if (v->kind == JsonNode::K::Arr && v->arr.size() <= limits.max_annotation_count) {
-      for (const auto& a : v->arr) {
-        if (a.kind != JsonNode::K::Obj) continue;
-        Annotation an;
-        for (const auto& kv : a.obj) {
-          if (kv.first == "k" && kv.second.kind == JsonNode::K::Str) an.key = kv.second.str;
-          if (kv.first == "v" && kv.second.kind == JsonNode::K::Str) an.value = kv.second.str;
-        }
-        if (an.key.size() <= limits.max_annotation_bytes) trace.annotations.push_back(std::move(an));
-      }
+  if (const JsonNode* recs = given(root, "records")) {
+    if (recs->kind != JsonNode::K::Arr) {
+      return fail<Trace>(ErrorCode::kMalformedInput, "records must be an array");
     }
-  }
-
-  const JsonNode* recs = get("records");
-  if (recs && recs->kind == JsonNode::K::Arr) {
     if (recs->arr.size() > limits.max_records) {
       return fail<Trace>(ErrorCode::kBoundExceeded, "record count bound");
     }
+    trace.records.reserve(recs->arr.size());
     for (const auto& rnode : recs->arr) {
-      if (rnode.kind != JsonNode::K::Obj) continue;
-      Observation o;
-      auto g = [&](const char* k) -> const JsonNode* {
-        for (const auto& kv : rnode.obj) if (kv.first == k) return &kv.second;
-        return nullptr;
-      };
-      if (auto v = g("id")) if (v->kind == JsonNode::K::Num) o.id = ObservationId{static_cast<std::uint64_t>(v->num)};
-      if (auto v = g("source")) if (v->kind == JsonNode::K::Num) o.source = SourceId{static_cast<std::uint64_t>(v->num)};
-      if (auto v = g("mono")) if (v->kind == JsonNode::K::Num) o.timestamp.monotonic = MonotonicTimestamp{static_cast<std::int64_t>(v->num)};
-      if (auto v = g("wall")) if (v->kind == JsonNode::K::Num) o.timestamp.wall = WallTimestamp{static_cast<std::int64_t>(v->num)};
-      if (auto v = g("seq")) if (v->kind == JsonNode::K::Num) o.timestamp.sequence = SequenceNo{static_cast<std::int64_t>(v->num)};
-      if (auto v = g("domain")) if (v->kind == JsonNode::K::Num) o.domain = DomainId{static_cast<std::uint64_t>(v->num)};
-      if (auto v = g("domain_kind")) if (v->kind == JsonNode::K::Str) o.domain_kind = domain_kind_from_string(v->str);
-      if (auto v = g("generation")) if (v->kind == JsonNode::K::Num) o.generation = Generation{static_cast<std::uint64_t>(v->num)};
-      if (auto v = g("epoch")) if (v->kind == JsonNode::K::Num) o.epoch = Epoch{static_cast<std::uint64_t>(v->num)};
-      if (auto v = g("mech")) if (v->kind == JsonNode::K::Str) { /* mechanism enum */ }
-      if (auto v = g("confidence")) if (v->kind == JsonNode::K::Num) o.provenance.confidence = Confidence{v->num};
-      if (const JsonNode* p = g("payload")) {
-        if (p->kind == JsonNode::K::Obj) {
-          std::string type = "none";
-          for (const auto& kv : p->obj) if (kv.first == "type" && kv.second.kind == JsonNode::K::Str) type = kv.second.str;
-          auto pg = [&](const char* k) -> const JsonNode* {
-            for (const auto& kv : p->obj) if (kv.first == k) return &kv.second;
-            return nullptr;
-          };
-          if (type == "metric") {
-            std::string mtype = "gauge";
-            if (auto v = pg("mtype")) if (v->kind == JsonNode::K::Str) mtype = v->str;
-            const auto& kindname = (pg("kind") && pg("kind")->kind == JsonNode::K::Str) ? pg("kind")->str : "unknown";
-            const MemoryKind kind = (kindname == "available") ? MemoryKind::kAvailable
-                                   : (kindname == "allocated") ? MemoryKind::kAllocated
-                                   : (kindname == "committed") ? MemoryKind::kCommitted
-                                   : (kindname == "physical") ? MemoryKind::kPhysical
-                                   : MemoryKind::kOther;
-            if (mtype == "gauge") { GaugeSample g_; g_.kind = kind; if (auto v = pg("value")) if (v->kind == JsonNode::K::Num) g_.value = v->num; o.payload = g_; }
-            else if (mtype == "counter") { CounterSample c; c.kind = kind; if (auto v = pg("value")) if (v->kind == JsonNode::K::Num) c.value = static_cast<std::uint64_t>(v->num); if (auto v = pg("reset")) if (v->kind == JsonNode::K::Bool) c.reset = v->b; o.payload = c; }
-            else if (mtype == "distribution") { DistributionSample d; d.kind = kind; if (auto v = pg("mean")) if (v->kind == JsonNode::K::Num) d.summary.mean = v->num; if (auto v = pg("p95")) if (v->kind == JsonNode::K::Num) d.summary.p95 = v->num; if (auto v = pg("p99")) if (v->kind == JsonNode::K::Num) d.summary.p99 = v->num; o.payload = d; }
-          } else if (type == "event") {
-            Event e; if (auto v = pg("message")) if (v->kind == JsonNode::K::Str) e.message = v->str; o.payload = e;
-          } else if (type == "domain_state") {
-            DomainState ds; if (auto v = pg("domain")) if (v->kind == JsonNode::K::Num) ds.domain = DomainId{static_cast<std::uint64_t>(v->num)};
-            auto rd = [&](const char* k) -> std::optional<Bytes> { if (auto v = pg(k)) if (v->kind == JsonNode::K::Num) return static_cast<Bytes>(v->num); return std::nullopt; };
-            ds.capacity.physical = rd("physical"); ds.capacity.governed = rd("governed");
-            ds.capacity.available = rd("available"); ds.capacity.allocated = rd("allocated");
-            o.payload = ds;
-          }
-        }
-      }
-      if (const JsonNode* an = g("annotations")) {
-        if (an->kind == JsonNode::K::Arr) {
-          for (const auto& a : an->arr) {
-            if (a.kind != JsonNode::K::Obj) continue;
-            Annotation x;
-            for (const auto& kv : a.obj) { if (kv.first == "k" && kv.second.kind == JsonNode::K::Str) x.key = kv.second.str; if (kv.first == "v" && kv.second.kind == JsonNode::K::Str) x.value = kv.second.str; }
-            o.annotations.push_back(std::move(x));
-          }
-        }
-      }
       TraceRecord rec;
-      rec.observation = std::move(o);
+      const ErrorCode code = read_record(rnode, limits, rec.observation);
+      if (code != ErrorCode::kNone) {
+        return fail<Trace>(code, "bad trace record");
+      }
       trace.records.push_back(std::move(rec));
     }
   }

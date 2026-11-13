@@ -87,7 +87,14 @@ struct Window {
     return begin + length;
   }
   [[nodiscard]] bool contains(MonotonicTimestamp t) const noexcept {
-    return t >= begin && t < end();
+    // Measured as an offset from begin in unsigned arithmetic, so a window that
+    // reaches past the end of the clock's range does not overflow.
+    if (length.negative() || t < begin) {
+      return false;
+    }
+    const std::uint64_t offset = static_cast<std::uint64_t>(t.nanoseconds()) -
+                                 static_cast<std::uint64_t>(begin.nanoseconds());
+    return offset < static_cast<std::uint64_t>(length.nanoseconds());
   }
   friend bool operator==(const Window&, const Window&) = default;
 };

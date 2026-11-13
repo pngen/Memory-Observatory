@@ -152,3 +152,84 @@ TEST(compare_renders_text_json_csv) {
   CHECK(json.find("\"findings\"") != std::string::npos);
   CHECK(csv.find("category,kind") != std::string::npos);
 }
+
+// ---------------------------------------------------------------------------
+// Whole-trace coverage, identical-input claims, JSON rendering.
+// ---------------------------------------------------------------------------
+
+#include <string>
+
+TEST(compare_covers_traces_longer_than_the_default_history) {
+  // 100,000 is the Observatory's default history bound.
+  const std::uint64_t n = 100050;
+  Trace a = make_trace(1, 5, 7, MemoryKind::kCommitted, 1000, 0, n);
+  Trace b = a;
+  // The traces differ only at the very beginning.
+  for (std::size_t i = 0; i < 40; ++i) {
+    GaugeSample g;
+    g.kind = MemoryKind::kCommitted;
+    g.value = 900000.0;
+    b.records[i].observation.payload = g;
+  }
+  auto c = compare_traces(a, b);
+  REQUIRE(c.ok());
+  CHECK_EQ(c.value().left_observations, n);
+  CHECK_EQ(c.value().right_observations, n);
+  CHECK(!c.value().identical_inputs);
+  bool mean_differs = false;
+  for (const auto& md : c.value().metrics) {
+    if (md.kind == MemoryKind::kCommitted && md.mean_delta && *md.mean_delta > 1.0) {
+      mean_differs = true;
+    }
+  }
+  CHECK(mean_differs);
+}
+
+TEST(compare_does_not_call_different_records_identical) {
+  auto set_gauge = [](Trace& t, std::size_t i, double v) {
+    GaugeSample g;
+    g.kind = MemoryKind::kAllocated;
+    g.value = v;
+    t.records[i].observation.payload = g;
+  };
+  // The same counts and the same mean, from different observations.
+  Trace a = make_trace(100, 5, 7, MemoryKind::kAllocated, 1000, 0, 2);
+  Trace b = a;
+  set_gauge(a, 0, 3000);
+  set_gauge(a, 1, 1000);
+  set_gauge(b, 0, 2000);
+  set_gauge(b, 1, 2000);
+  auto c = compare_traces(a, b);
+  REQUIRE(c.ok());
+  CHECK(!c.value().identical_inputs);
+  CHECK(!c.value().findings.empty());
+
+  // State payloads are not metrics, so no metric summary sees them differ.
+  Trace s1 = make_trace(100, 5, 7, MemoryKind::kAllocated, 1000, 0, 1);
+  Trace s2 = s1;
+  DomainState ds;
+  ds.domain = DomainId{5};
+  ds.capacity.physical = 1000;
+  ds.capacity.available = 900;
+  s1.records[0].observation.payload = ds;
+  ds.capacity.available = 800;
+  s2.records[0].observation.payload = ds;
+  auto c2 = compare_traces(s1, s2);
+  REQUIRE(c2.ok());
+  CHECK(!c2.value().identical_inputs);
+}
+
+TEST(compare_json_is_well_formed) {
+  Trace a = make_trace(100, 5, 7, MemoryKind::kAllocated, 1000, 50);
+  Trace b = make_trace(100, 5, 8, MemoryKind::kAvailable, 2000, 10);
+  auto c = compare_traces(a, b);
+  REQUIRE(c.ok());
+  const std::string json = render_compare_json(c.value());
+  CHECK(json.find("\"observations\":[20,20]") != std::string::npos);
+  // Every object opens on a key or is empty: none holds bare values.
+  bool bare = false;
+  for (std::size_t i = 0; i + 1 < json.size(); ++i) {
+    if (json[i] == '{' && json[i + 1] != '"' && json[i + 1] != '}') bare = true;
+  }
+  CHECK(!bare);
+}

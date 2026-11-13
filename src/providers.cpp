@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstring>
 #include <cstdint>
+#include <mutex>
 #include <random>
 #include <string>
 #include <vector>
@@ -248,6 +249,7 @@ struct CudaAccess {
 
   using RMemGetInfo = int (*)(std::size_t*, std::size_t*);
   using RSetDevice = int (*)(int);
+  using RGetDevice = int (*)(int*);
   using RSync = int (*)(void);
   using RDeviceCount = int (*)(int*);
   using RDeviceProps = int (*)(void*, int);
@@ -255,6 +257,7 @@ struct CudaAccess {
   using RRuntimeVersion = int (*)(int*);
   RMemGetInfo rMemGetInfo = nullptr;
   RSetDevice rSetDevice = nullptr;
+  RGetDevice rGetDevice = nullptr;
   RSync rSync = nullptr;
   RDeviceCount rDeviceCount = nullptr;
   RDeviceProps rDeviceProps = nullptr;
@@ -268,6 +271,7 @@ struct CudaAccess {
   using DDeviceName = int (*)(char*, int, int);
   using DCtxRetain = int (*)(std::uint64_t*, int);
   using DCtxSet = int (*)(std::uint64_t);
+  using DCtxGet = int (*)(std::uint64_t*);
   using DSync = int (*)(void);
   using DDriverVersion = int (*)(int*);
   using DGetErrorString = int (*)(int, const char**);
@@ -278,6 +282,7 @@ struct CudaAccess {
   DDeviceName dDeviceName = nullptr;
   DCtxRetain dCtxRetain = nullptr;
   DCtxSet dCtxSet = nullptr;
+  DCtxGet dCtxGet = nullptr;
   DSync dSync = nullptr;
   DDriverVersion dDriverVersion = nullptr;
   DGetErrorString dGetErrorString = nullptr;
@@ -324,6 +329,7 @@ CudaAccess load_cuda() {
       a.is_runtime = true;
       a.rMemGetInfo = loadfn<CudaAccess::RMemGetInfo>(h, "cudaMemGetInfo");
       a.rSetDevice = loadfn<CudaAccess::RSetDevice>(h, "cudaSetDevice");
+      a.rGetDevice = loadfn<CudaAccess::RGetDevice>(h, "cudaGetDevice");
       a.rSync = loadfn<CudaAccess::RSync>(h, "cudaDeviceSynchronize");
       a.rDeviceCount = loadfn<CudaAccess::RDeviceCount>(h, "cudaGetDeviceCount");
       a.rDeviceProps = loadfn<CudaAccess::RDeviceProps>(h, "cudaGetDeviceProperties");
@@ -345,6 +351,7 @@ CudaAccess load_cuda() {
       if (!a.dMemGetInfo) a.dMemGetInfo = loadfn<CudaAccess::DMemGetInfo>(h, "cuMemGetInfo");
       a.dCtxRetain = loadfn<CudaAccess::DCtxRetain>(h, "cuDevicePrimaryCtxRetain");
       a.dCtxSet = loadfn<CudaAccess::DCtxSet>(h, "cuCtxSetCurrent");
+      a.dCtxGet = loadfn<CudaAccess::DCtxGet>(h, "cuCtxGetCurrent");
       a.dSync = loadfn<CudaAccess::DSync>(h, "cuCtxSynchronize");
       a.dDriverVersion = loadfn<CudaAccess::DDriverVersion>(h, "cuDriverGetVersion");
       a.dGetErrorString = loadfn<CudaAccess::DGetErrorString>(h, "cuGetErrorString");
@@ -365,6 +372,10 @@ CudaAccess& cuda() {
 std::string query_cuda(std::size_t& free_b, std::size_t& total_b, int& device_ordinal,
                        std::string& device_name, std::string& driver_version,
                        std::string& runtime_version) {
+  // The backend handle and its retained context are shared by every provider
+  // instance and every thread that samples.
+  static std::mutex query_mutex;
+  std::lock_guard<std::mutex> query_lock(query_mutex);
   CudaAccess& a = cuda();
   int rc = 0;
   int dev_count = 0;
@@ -373,11 +384,17 @@ std::string query_cuda(std::size_t& free_b, std::size_t& total_b, int& device_or
     rc = a.rDeviceCount ? a.rDeviceCount(&dev_count) : -1;
     if (rc != 0) return "cudaGetDeviceCount: " + a.error_string(rc);
     if (dev_count <= 0) return "no CUDA device present";
+    // Sampling is observation only: the calling thread goes back to the device
+    // it was using, on every way out.
+    int previous_device = 0;
+    const bool have_previous = a.rGetDevice && a.rGetDevice(&previous_device) == 0;
     rc = a.rSetDevice ? a.rSetDevice(0) : -1;
     if (rc != 0) return "cudaSetDevice(0): " + a.error_string(rc);
-    if (a.rSync) { rc = a.rSync(); if (rc != 0) return "cudaDeviceSynchronize: " + a.error_string(rc); }
-    rc = a.rMemGetInfo(&free_b, &total_b);
-    if (rc != 0) return "cudaMemGetInfo: " + a.error_string(rc);
+    const int sync_rc = a.rSync ? a.rSync() : 0;
+    const int mem_rc = sync_rc == 0 ? a.rMemGetInfo(&free_b, &total_b) : 0;
+    if (have_previous && previous_device != 0) (void)a.rSetDevice(previous_device);
+    if (sync_rc != 0) return "cudaDeviceSynchronize: " + a.error_string(sync_rc);
+    if (mem_rc != 0) return "cudaMemGetInfo: " + a.error_string(mem_rc);
     device_ordinal = 0;
     int dv = 0;
     if (a.rDriverVersion) a.rDriverVersion(&dv);
@@ -386,9 +403,13 @@ std::string query_cuda(std::size_t& free_b, std::size_t& total_b, int& device_or
     if (a.rRuntimeVersion) a.rRuntimeVersion(&rv);
     runtime_version = std::to_string(rv);
     if (a.rDeviceProps) {
-      struct Props { char name[256]; int major; int minor; int total_mem; int multi; };
-      Props p{};
-      if (a.rDeviceProps(&p, 0) == 0) device_name = p.name;
+      // The runtime fills in a whole cudaDeviceProp, which is far larger than
+      // its leading name field and grows between toolkit versions.
+      std::vector<unsigned char> props(16384, 0);
+      if (a.rDeviceProps(props.data(), 0) == 0) {
+        const char* name = reinterpret_cast<const char*>(props.data());
+        device_name.assign(name, strnlen(name, 256));
+      }
     }
     if (device_name.empty()) device_name = "cuda-device-0";
     return "";
@@ -409,9 +430,16 @@ std::string query_cuda(std::size_t& free_b, std::size_t& total_b, int& device_or
     if (rc != 0) return "cuDevicePrimaryCtxRetain: " + a.error_string(rc);
     a.context_ready = true;
   }
+  // Sampling is observation only: whatever context the calling thread had
+  // current is current again once the reading is taken.
+  std::uint64_t previous_context = 0;
+  const bool have_previous = a.dCtxGet && a.dCtxGet(&previous_context) == 0;
   rc = a.dCtxSet ? a.dCtxSet(a.context) : -1;
   if (rc != 0) return "cuCtxSetCurrent: " + a.error_string(rc);
   rc = a.dMemGetInfo(&free_b, &total_b);
+  if (have_previous && previous_context != a.context) {
+    (void)a.dCtxSet(previous_context);
+  }
   if (rc != 0) return "cuMemGetInfo_v2: " + a.error_string(rc);
   device_ordinal = dev;
   char nm[256] = {};

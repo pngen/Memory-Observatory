@@ -290,3 +290,51 @@ TEST(cuda_bounded_allocation_causes_observable_delta) {
   CHECK(true);
 #endif
 }
+
+TEST(cuda_provider_leaves_the_callers_context_current) {
+#if defined(_WIN32)
+  auto prov = make_cuda_provider();
+  using CtxGet = int (*)(unsigned long long*);
+  CtxGet ctx_get = test_cuda().h
+      ? reinterpret_cast<CtxGet>(GetProcAddress(test_cuda().h, "cuCtxGetCurrent"))
+      : nullptr;
+  if (!prov || !ctx_get || !test_cuda().ctxCreate || !test_cuda().ctxSet ||
+      !test_cuda().ctxDestroy) {
+    std::printf("  (CUDA driver API unavailable; context check skipped)\n");
+    CHECK(true);
+    return;
+  }
+  // The check is about the driver-API path, where the provider binds a context.
+  bool driver_backend = false;
+  {
+    Provider::CollectResult probe = prov->collect();
+    for (const auto& s : probe.samples) {
+      for (const auto& a : s.annotations) {
+        if (a.key == "cuda_backend" && a.value == "cuda_driver") driver_backend = true;
+      }
+    }
+  }
+  if (!driver_backend) {
+    std::printf("  (CUDA provider is not on the driver API; context check skipped)\n");
+    CHECK(true);
+    return;
+  }
+  // The caller is working in a context of its own.
+  unsigned long long mine = 0;
+  if (test_cuda().ctxCreate(&mine, 0, 0) != 0 || mine == 0) {
+    std::printf("  (could not create a CUDA context; context check skipped)\n");
+    CHECK(true);
+    return;
+  }
+  (void)test_cuda().ctxSet(mine);
+  (void)prov->collect();
+  unsigned long long current = 0;
+  CHECK(ctx_get(&current) == 0);
+  CHECK(current == mine);
+  // Back to the primary context the other CUDA tests use, then release.
+  (void)test_cuda().ctxSet(test_cuda().ctx);
+  (void)test_cuda().ctxDestroy(mine);
+#else
+  CHECK(true);
+#endif
+}

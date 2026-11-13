@@ -54,7 +54,13 @@ struct Side {
 
 Side build_side(const Trace& trace) {
   Side side;
-  Observatory obs;
+  // The whole trace is compared, so the history has to hold the whole trace:
+  // with the default bound, everything before the last 100000 records would be
+  // evicted and left out of the comparison.
+  ObservatoryConfig cfg;
+  cfg.history_capacity = std::max<std::size_t>(trace.records.size(), 1);
+  cfg.dedup_capacity = std::max(cfg.dedup_capacity, cfg.history_capacity);
+  Observatory obs(cfg);
   for (const auto& rec : trace.records) {
     Observation o = rec.observation;
     (void)obs.observe(std::move(o));
@@ -66,6 +72,14 @@ Side build_side(const Trace& trace) {
     for (const auto& e : tl.value().entries) side.timeline.push_back(e.observation);
   }
   side.diagnostics = obs.evaluate_diagnostics();
+  // Staleness is read off this process's clock while the comparison runs. It
+  // says nothing about the trace, and would make the result depend on timing.
+  side.diagnostics.erase(
+      std::remove_if(side.diagnostics.begin(), side.diagnostics.end(),
+                     [](const Diagnostic& d) {
+                       return d.code == DiagnosticCode::kStaleTelemetry;
+                     }),
+      side.diagnostics.end());
   side.correlations = obs.evaluate_correlations();
   // Derive the observed domain inventory from the timeline (the Observatory only
   // tracks explicitly registered domains; observed-but-unregistered domains are
@@ -234,6 +248,14 @@ Result<ComparisonReport> compare_traces(const Trace& left, const Trace& right) {
         "provenance differs; sources/mechanisms are not identical"});
   }
 
+  // The findings above summarize: two traces can agree on every count and
+  // every mean and still hold different observations. Inputs are identical
+  // only when their records are.
+  if (report.findings.empty() && !(left.records == right.records)) {
+    report.findings.push_back({CompareKind::kMeasured, "records",
+        "observation records differ"});
+  }
+
   report.identical_inputs = report.findings.empty();
 
   return ok(std::move(report));
@@ -288,10 +310,11 @@ std::string render_compare_json(const ComparisonReport& r) {
   std::ostringstream os;
   os << "{";
   os << "\"identical\":" << (r.identical_inputs ? "true" : "false") << ",";
-  os << "\"observations\":{" << r.left_observations << "," << r.right_observations << "},";
-  os << "\"events\":{" << r.left_events << "," << r.right_events << "},";
-  os << "\"dropped\":{" << r.left_dropped << "," << r.right_dropped << "},";
-  os << "\"rejected\":{" << r.left_rejected << "," << r.right_rejected << "},";
+  // Each left/right pair is an array: a JSON object cannot hold bare values.
+  os << "\"observations\":[" << r.left_observations << "," << r.right_observations << "],";
+  os << "\"events\":[" << r.left_events << "," << r.right_events << "],";
+  os << "\"dropped\":[" << r.left_dropped << "," << r.right_dropped << "],";
+  os << "\"rejected\":[" << r.left_rejected << "," << r.right_rejected << "],";
   os << "\"metrics\":[";
   bool first = true;
   for (const auto& md : r.metrics) {

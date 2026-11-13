@@ -142,6 +142,10 @@ struct Provenance {
 
   // Arbitrary key/value annotations supplied by producers or adapters.
   std::vector<std::pair<std::string, std::string>> annotations;
+
+  // Observation, Diagnostic, Snapshot and Trace default their equality over
+  // this member, so it has to be comparable for those to be usable.
+  friend bool operator==(const Provenance&, const Provenance&) = default;
 };
 
 }  // namespace memory_observatory

@@ -100,15 +100,22 @@ struct Sampler::Impl {
   std::atomic<bool> stopping_{false};
   std::atomic<bool> running_{false};
   std::thread worker_;
+  // The worker's own id while its loop runs, so a call made from inside it (a
+  // subscriber or a provider) can be told apart from a call made by its owner.
+  std::atomic<std::thread::id> worker_id_{};
   std::mutex cv_m_;
   std::condition_variable cv_;
 
-  SequenceNo next_seq_;
+  // Collection passes may run on the worker and on callers' threads at once.
+  std::atomic<std::int64_t> next_seq_{0};
   std::uint64_t samples_taken_ = 0;
   std::uint64_t failures_ = 0;
   std::uint64_t recoveries_ = 0;
 
+  SequenceNo take_sequence() noexcept { return SequenceNo{next_seq_.fetch_add(1)}; }
+
   void thread_loop() {
+    worker_id_.store(std::this_thread::get_id());
     while (true) {
       bool stop = false;
       {
@@ -123,6 +130,7 @@ struct Sampler::Impl {
         (void)owner->collect_once();
       }
     }
+    worker_id_.store(std::thread::id{});
     running_.store(false);
   }
 };
@@ -174,14 +182,22 @@ Error Sampler::collect_once() {
     snapshot = impl_->providers_;
   }
   const MonotonicTimestamp now = MonotonicTimestamp::now();
+  // Only the worker's own pass is cut short by a stop. A pass a caller asked
+  // for runs to the end, whether or not the sampler was started and stopped.
+  const bool worker_pass = impl_->worker_id_.load() == std::this_thread::get_id();
   for (const auto& entry : snapshot) {
-    if (impl_->stopping_.load()) {
+    if (worker_pass && impl_->stopping_.load()) {
       break;
     }
-    bool ok = entry.provider->available();
+    // Provider code is foreign. A throw is a failed collection: it must not
+    // unwind through the sampler, where on the worker it would end the process.
     Provider::CollectResult cr;
-    if (ok) {
-      cr = entry.provider->collect();
+    try {
+      if (entry.provider->available()) {
+        cr = entry.provider->collect();
+      }
+    } catch (...) {
+      cr = Provider::CollectResult{};
     }
     bool was_failed = false;
     {
@@ -198,7 +214,7 @@ Error Sampler::collect_once() {
           entry.source, entry.domain, EventType::kProviderUnavailable,
           EventSeverity::kWarning,
           "provider '" + entry.provider->name() + "' unavailable or failed",
-          impl_->next_seq_++, now);
+          impl_->take_sequence(), now);
       (void)impl_->observatory.observe(std::move(ev));
       continue;
     }
@@ -213,13 +229,13 @@ Error Sampler::collect_once() {
           entry.source, entry.domain, EventType::kProviderRecovered,
           EventSeverity::kInfo,
           "provider '" + entry.provider->name() + "' recovered",
-          impl_->next_seq_++, now);
+          impl_->take_sequence(), now);
       (void)impl_->observatory.observe(std::move(ev));
     }
     for (const auto& sample : cr.samples) {
       Observation o = sample_to_observation(sample, entry.source, entry.domain,
                                             entry.provider->primary_domain(),
-                                            *entry.provider, impl_->next_seq_++,
+                                            *entry.provider, impl_->take_sequence(),
                                             now);
       (void)impl_->observatory.observe(std::move(o));
       std::lock_guard<std::mutex> lock(impl_->mutex_);
@@ -233,18 +249,40 @@ Error Sampler::start() {
   if (impl_->running_.load()) {
     return make_error(ErrorCode::kInvalidState, "sampler already running");
   }
+  // The worker waits one period between passes; without a positive period it
+  // would not wait at all.
+  if (impl_->config.period.nanoseconds() <= 0) {
+    return make_error(ErrorCode::kInvalidArgument,
+                      "sampling period must be positive");
+  }
+  if (impl_->worker_.joinable()) {
+    impl_->worker_.join();  // a worker that stopped itself has left its loop
+  }
   impl_->stopping_.store(false);
-  impl_->worker_ = std::thread([this] { impl_->thread_loop(); });
   impl_->running_.store(true);
+  try {
+    impl_->worker_ = std::thread([this] { impl_->thread_loop(); });
+  } catch (...) {
+    impl_->running_.store(false);
+    return make_error(ErrorCode::kInternal, "could not start the sampler thread");
+  }
   return Error{};
 }
 
 Error Sampler::stop() {
-  if (!impl_->running_.load()) {
+  {
+    // Set under the lock the worker waits on, so the worker cannot test the
+    // flag, miss this notification and then sleep out a whole period.
+    std::lock_guard<std::mutex> lk(impl_->cv_m_);
+    impl_->stopping_.store(true);
+  }
+  impl_->cv_.notify_all();
+  if (impl_->worker_id_.load() == std::this_thread::get_id()) {
+    // Called from inside the worker, which cannot join itself. It leaves its
+    // loop after the current pass and is joined by the next stop(), by start()
+    // or by the destructor.
     return Error{};
   }
-  impl_->stopping_.store(true);
-  impl_->cv_.notify_all();
   if (impl_->worker_.joinable()) {
     impl_->worker_.join();
   }
